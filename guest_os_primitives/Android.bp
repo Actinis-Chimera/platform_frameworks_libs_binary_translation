@@ -221,6 +221,12 @@ cc_library_static {
         "libberberis_guest_os_primitives_common_arch_defaults",
     ],
     host_supported: true,
+    product_variables: {
+        debuggable: {
+            cflags: ["-DDRION_ENABLE_NATIVE_BRIDGE_GUEST_CRASH_DIAGNOSTICS"],
+            srcs: ["//vendor/actinis/drion/aosp:drion_native_bridge_materialized_snapshot_srcs"],
+        },
+    },
     arch: {
         x86_64: {
             srcs: [

@@ -39,10 +39,16 @@ cc_library_shared {
         "berberis_proxy_library_defaults",
         "//frameworks/libs/native_bridge_support/android_api/libc:native_bridge_proxy_libc_defaults",
     ],
+    product_variables: {
+        debuggable: {
+            cflags: ["-DBERBERIS_ENABLE_GUEST_FREE_DIAGNOSTICS"],
+        },
+    },
     arch: {
         x86_64: {
             srcs: [
                 "free_quarantine.cc",
+                "free_quarantine_diagnostics.cc",
             ],
             ldflags: [
                 "-Wl,--wrap=free",
