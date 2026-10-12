@@ -44,6 +44,18 @@ void RenameCopyUsesMap::RenameUseIfMapped(berberis::MachineInsn* insn, int i) {
   }
   // Renaming is only possible for USE without DEF.
   MachineReg mapped = Get(reg);
+  // region digitalis
+  // An early-clobber def is written before the uses are read, so a use must never be renamed
+  // to the register it clobbers.
+  if (mapped != kInvalidMachineReg) {
+    for (int j = 0; j < insn->NumRegOperands(); ++j) {
+      if (insn->RegKindAt(j).IsDef() && !insn->RegKindAt(j).IsInput() &&
+          insn->RegKindAt(j).IsUse() && insn->RegAt(j) == mapped) {
+        return;
+      }
+    }
+  }
+  // endregion
   if (mapped != kInvalidMachineReg) {
     insn->SetRegAt(i, mapped);
   }
@@ -91,14 +103,22 @@ void RenameCopyUses(MachineIR* machine_ir) {
     map.StartBasicBlock(bb);
 
     for (berberis::MachineInsn* insn : bb->insn_list()) {
+      // region digitalis
+      // An instruction reads its uses before it writes its defs, so rename every use first:
+      // otherwise a def that comes earlier in the operand list (`pmovsxbw x, x` after
+      // `x = copy y`) drops the mapping its own use still needs, and the copy stays.
       for (int i = 0; i < insn->NumRegOperands(); ++i) {
         // Note that Def-Use operands cannot be renamed, so we handle them as Defs.
-        if (insn->RegKindAt(i).IsDef()) {
-          map.ProcessDef(insn, i);
-        } else {
+        if (!insn->RegKindAt(i).IsDef()) {
           map.RenameUseIfMapped(insn, i);
         }
-      }  // for operand in insn
+      }  // for use operand in insn
+      for (int i = 0; i < insn->NumRegOperands(); ++i) {
+        if (insn->RegKindAt(i).IsDef()) {
+          map.ProcessDef(insn, i);
+        }
+      }  // for def operand in insn
+      // endregion
 
       // Note that we intentionally rename copy's use before attempting to create a mapping, so that
       // the existing mappings are applied and propagated further.
