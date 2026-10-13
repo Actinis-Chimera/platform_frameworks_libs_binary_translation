@@ -30,12 +30,16 @@
 // region digitalis
 #include "berberis/backend/x86_64/place_blocks_before_branch_targets.h"
 #include "berberis/backend/x86_64/remove_nop_reg_moves.h"
+#include "berberis/backend/x86_64/use_vex_three_operand_forms.h"
 // endregion
 #include "berberis/backend/x86_64/rename_copy_uses.h"
 #include "berberis/backend/x86_64/rename_vregs.h"
 #include "berberis/base/checks.h"
 #include "berberis/base/config_globals.h"
 #include "berberis/base/tracing.h"
+// region digitalis
+#include "berberis/runtime_primitives/platform.h"
+// endregion
 
 namespace berberis::x86_64 {
 
@@ -77,6 +81,11 @@ void GenCode(MachineIR* machine_ir, MachineCode* machine_code, const GenCodePara
     FoldWriteFlags(machine_ir);
     // TODO(369881234): Re-enable after root causing and fixing the crash.
     // OptimizeReadFlags(machine_ir);
+    // region digitalis
+    if (host_platform::kHasAVX) {
+      UseVexThreeOperandForms(machine_ir);
+    }
+    // endregion
   }
 
   AllocRegs(machine_ir);
