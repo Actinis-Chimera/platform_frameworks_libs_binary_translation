@@ -19,10 +19,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 
 #include "berberis/backend/x86_64/machine_ir.h"
 #include "berberis/backend/x86_64/machine_ir_builder.h"
 #include "berberis/base/arena_map.h"
+#include "berberis/base/arena_vector.h"
 #include "berberis/base/checks.h"
 #include "berberis/decoder/arm64/decoder.h"
 #include "berberis/decoder/arm64/semantics_player.h"
@@ -102,7 +104,8 @@ class HeavyOptimizerFrontend {
         builder_(machine_ir),
         flag_register_(machine_ir->AllocVReg()),
         is_uncond_branch_(false),
-        branch_targets_(machine_ir->arena()) {
+        branch_targets_(machine_ir->arena()),
+        fused_cond_branches_(machine_ir->arena()) {
     StartRegion();
   }
 
@@ -166,6 +169,12 @@ class HeavyOptimizerFrontend {
     }
     return result;
   }
+
+  // The destination of a 32-bit x86 op that unconditionally writes it: that
+  // write zero-extends the result into the upper half (the ARM64 W-write), so
+  // the copy needs no MOVL of its own and the allocator may coalesce it away.
+  // A caller whose 32-bit op is conditional keeps an explicit MOVL.
+  [[nodiscard]] Register CopyForWrite32(Register value) { return Copy(value); }
 
   [[nodiscard]] bool success() const { return success_; }
 
@@ -717,6 +726,28 @@ class HeavyOptimizerFrontend {
     return tbi;
   }
 
+  // 8/16-bit (B/H) LDR/STR (SIMD&FP) at [masked + disp] through a GP register:
+  // a load zero-extends with MOVZX, moves into a fresh XMM with MOVD (which
+  // clears bits 127:32) and commits the full 16-byte V[rt] slot; a store reads
+  // the low lane with MOVD and writes one byte or word. The memory access is
+  // recovery-wrapped.
+  void EmitSimdLoadStoreNarrow(bool is_store,
+                               Decoder::SimdLoadStoreSize size,
+                               Register masked,
+                               int32_t disp,
+                               int32_t vreg_off);
+
+  // Vector SQDMULH/SQRDMULH (size 01 or 10) on loaded operands; the caller
+  // bails first unless SqdmulhVecSupported. Clobbers xn.
+  [[nodiscard]] static bool SqdmulhVecSupported(uint8_t size, bool is_round);
+  [[nodiscard]] FpRegister EmitSqdmulhVec(FpRegister xn, FpRegister xm, uint8_t size, bool is_round);
+
+  // Broadcast lane `index` of xm (16-bit lanes when is_halfword, else 32-bit).
+  void EmitBroadcastVmLane(FpRegister xm, bool is_halfword, uint8_t index);
+
+  // `lea addr, [base + index * (1 << shift_amount)]` into a fresh register;
+  // shift_amount is 0-3.
+  [[nodiscard]] Register EmitLeaBaseIndex(Register base, Register index, uint8_t shift_amount);
   [[nodiscard]] Register EmitRegOffsetAddr(Register base,
                                            Register offset_reg,
                                            uint8_t extend_type,
@@ -772,6 +803,14 @@ class HeavyOptimizerFrontend {
                                                int8_t{0});
     SetVRegScalar(reg, val, /*is_double=*/false);
   }
+
+  // ARM FMAX/FMIN/FMAXNM/FMINNM on every FP32 (or FP64) lane of `n` and `m`; both
+  // registers are clobbered. Returns the register holding the result.
+  [[nodiscard]] FpRegister EmitArmFpMinMax(FpRegister n,
+                                           FpRegister m,
+                                           bool is_max,
+                                           bool is_nm,
+                                           bool is_double);
 
   // Widen the FP16 lanes of the 16-byte guest V slot at `voff` to FP32 for a heavy
   // vector FP16 op. The low 4 halves (lanes 0..3) land as 4 FP32 in `*lo`; for q (.8H)
@@ -910,10 +949,42 @@ class HeavyOptimizerFrontend {
   [[nodiscard]] Register EmitArmCondPredicate(Decoder::Condition cond);
 
   // Emit a conditional branch to then_bb when `cond` is met, else_bb otherwise,
-  // by testing the EmitArmCondPredicate result.
+  // by testing the NZCV word directly (no 0/1 predicate is built).
   void EmitCondBranch(Decoder::Condition cond,
                       MachineBasicBlock* then_bb,
                       MachineBasicBlock* else_bb);
+
+  // The AND, optional XOR and store of an EmitMaterializeNZCV sequence that
+  // ends the current block, or is followed only by gap instructions, taken out
+  // so that a B.cond can test the host flags its PseudoReadFlags still sees.
+  // EmitNZCVStoreTail re-emits them in a successor. The guest instructions in
+  // [gap_begin, B.cond) emitted the gap.
+  struct NZCVStoreTail {
+    Register raw;
+    Register host_flags;
+    bool is_sub;
+    x86_64::Assembler::Condition host_cond;
+    GuestAddr gap_begin;
+  };
+  // At most this many machine instructions between the store and the B.cond.
+  static constexpr size_t kMaxNZCVGapInsns = 256;
+  [[nodiscard]] std::optional<NZCVStoreTail> TakeNZCVStoreTail(Decoder::Condition cond);
+  [[nodiscard]] static bool IsNZCVStore(const MachineInsn* insn);
+  [[nodiscard]] static bool IsNZCVGapInsn(const MachineInsn* insn);
+  void EmitNZCVStoreTail(const NZCVStoreTail& tail);
+
+  // A B.cond that branches on its setter's host flags. Only the fall-through
+  // path from the setter has those flags, so a B.cond that an in-region jump
+  // also targets gets a separate entry block, and a jump into the gap exits
+  // the region (AddFusedCondBranchEntries).
+  struct FusedCondBranch {
+    GuestAddr addr;
+    Decoder::Condition cond;
+    NZCVStoreTail tail;
+    MachineBasicBlock* then_bb;
+    MachineBasicBlock* else_bb;
+  };
+  void AddFusedCondBranchEntries();
 
   // Map the x86 EFLAGS a preceding UCOMIS{S,D} left in `flags_vreg` to ARM64 FP
   // NZCV and store the packed word into ThreadState.cpu.flags. Bit-exact with
@@ -976,6 +1047,8 @@ class HeavyOptimizerFrontend {
   // branch targets the region jumps to. A target outside the current region has
   // an uninitialized position (its basic block is nullptr).
   ArenaMap<GuestAddr, MachineInsnPosition> branch_targets_;
+  // Every B.cond of the region that BranchCond fused with its setter.
+  ArenaVector<FusedCondBranch> fused_cond_branches_;
 
   template <typename... T>
   static constexpr void UNUSED_ARGS(const T&...) {}

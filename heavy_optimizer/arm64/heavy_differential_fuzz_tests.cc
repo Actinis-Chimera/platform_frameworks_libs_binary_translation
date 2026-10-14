@@ -181,7 +181,8 @@ class Arm64HeavyDifferentialFuzz : public ::testing::Test {
                          int n,
                          const InitState& in,
                          bool compare_fpsr,
-                         std::string* desc) {
+                         std::string* desc,
+                         bool interpret_after_exit = false) {
     GuestAddr start = ToGuestAddr(code);
     GuestAddr code_end = start + static_cast<GuestAddr>(n) * 4;
 
@@ -205,6 +206,14 @@ class Arm64HeavyDifferentialFuzz : public ::testing::Test {
 
     ScopedExecRegion exec(&mc);
     TestingRunGeneratedCode(&state_, exec.get(), stop);
+    // A region exit to an untranslated address returns here. With
+    // interpret_after_exit, the interpreter runs the rest from the state the
+    // exit left, as the runtime would.
+    int exit_guard = 0;
+    while (interpret_after_exit && state_.cpu.insn_addr >= start &&
+           state_.cpu.insn_addr < stop && exit_guard++ < 256) {
+      InterpretInsn(&state_);
+    }
     FullState heavy = Capture();
 
     // Interpreter to the same stop PC.
@@ -402,6 +411,49 @@ class Arm64HeavyDifferentialFuzz : public ::testing::Test {
            (L << 21) | (M << 20) | (Rm << 16) | (sel.opc << 12) | (H << 11) |
            (rn << 5) | rd;
   }
+
+  // region digitalis
+  // AdvSIMD three-different, the long and wide forms: SADDL/UADDL, SADDW/UADDW,
+  // SSUBL/USUBL, SSUBW/USUBW, SABAL/UABAL, SABDL/UABDL, SMLAL/UMLAL, SMLSL/UMLSL,
+  // SMULL/UMULL, and the signed-only SQDMLAL/SQDMLSL/SQDMULL. Q=1 ("2" forms)
+  // takes the upper 64 bits of the narrow sources.
+  uint32_t GenNeonThreeDiffLong() {
+    static const uint32_t kOpc[] = {0b0000, 0b0001, 0b0010, 0b0011, 0b0101, 0b0111,
+                                    0b1000, 0b1001, 0b1010, 0b1011, 0b1100, 0b1101};
+    uint32_t opc = kOpc[Rnd() % 12];
+    bool saturating = opc == 0b1001 || opc == 0b1011 || opc == 0b1101;
+    uint32_t u = saturating ? 0 : (Rnd() & 1);
+    uint32_t size = saturating ? 1 + (Rnd() & 1) : Rnd() % 3;
+    uint32_t q = Rnd() & 1;
+    uint32_t rn = Rnd() % 8;
+    uint32_t rm = Rnd() % 8;
+    uint32_t r = Rnd() % 3;
+    uint32_t rd = r == 0 ? rn : (r == 1 ? rm : (Rnd() % 8));
+    return (q << 30) | (u << 29) | (0b01110u << 24) | (size << 22) | (1u << 21) | (rm << 16) |
+           (opc << 12) | (rn << 5) | rd;
+  }
+
+  // SSHLL/USHLL (SXTL/UXTL at shift 0) at every element size, and the byte
+  // SSHR/USHR, all with Q sampled: the "2" forms widen the upper 64 bits.
+  uint32_t GenNeonWidenShiftByImm() {
+    uint32_t q = Rnd() & 1;
+    uint32_t u = Rnd() & 1;
+    uint32_t rn = Rnd() % 8;
+    uint32_t rd = (Rnd() & 1) ? rn : Rnd() % 8;
+    if (Rnd() % 4 == 0) {
+      // SSHR/USHR byte: immh = 0001, shift = 16 - immh:immb in [1, 8].
+      uint32_t immh_immb = 0b1000 | (Rnd() % 8);
+      return (q << 30) | (u << 29) | (0b011110u << 23) | (immh_immb << 16) | (0b000001u << 10) |
+             (rn << 5) | rd;
+    }
+    // SSHLL/USHLL: immh = 0001 (8B), 001x (4H) or 01xx (2S); shift = immh:immb - esize.
+    uint32_t esize_log = Rnd() % 3;
+    uint32_t esize = 8u << esize_log;
+    uint32_t immh_immb = esize | (Rnd() % esize);
+    return (q << 30) | (u << 29) | (0b011110u << 23) | (immh_immb << 16) | (0b101001u << 10) |
+           (rn << 5) | rd;
+  }
+  // endregion
 
   // Saturating doubling widening MUL/MAC by element: SQDMULL/SQDMLAL/SQDMLSL.
   //   SQDMULL opc=1011 | SQDMLAL opc=0011 | SQDMLSL opc=0111 (U=0, signed only)
@@ -926,6 +978,54 @@ TEST_F(Arm64HeavyDifferentialFuzz, IntDataProcRegion) {
   EXPECT_GT(compared, 200) << "heavy accepted too few integer regions";
 }
 
+// W-form ALU ops whose destination is a plain copy of Wn that a 32-bit x86 op
+// then overwrites: add/sub and logical (shifted register, flag-setting forms
+// too), add/sub (extended register), logical (immediate) and LSL (immediate).
+// The source X registers carry random upper halves, so a result whose upper
+// half is not cleared by the 32-bit write diverges from the interpreter.
+TEST_F(Arm64HeavyDifferentialFuzz, W32AluDirtyUpperHalves) {
+  Seed(0x3232D1E7A11F0E5BULL);
+  auto gen = [this]() -> uint32_t {
+    constexpr uint32_t kMaxReg = 13;
+    uint32_t rd = Rnd() % kMaxReg, rn = Rnd() % kMaxReg, rm = Rnd() % kMaxReg;
+    uint32_t op = Rnd() & 1, s = Rnd() & 1;
+    switch (Rnd() % 5) {
+      case 0:  // ADD/ADDS/SUB/SUBS Wd, Wn, Wm, LSL|LSR|ASR #imm6
+        return 0x0B000000U | (op << 30) | (s << 29) | ((Rnd() % 3) << 22) | (rm << 16) |
+               ((Rnd() % 32) << 10) | (rn << 5) | rd;
+      case 1:  // AND/ORR/EOR/ANDS (N: BIC/ORN/EON/BICS) Wd, Wn, Wm, shift #imm6
+        return 0x0A000000U | ((Rnd() % 4) << 29) | ((Rnd() % 4) << 22) | ((Rnd() & 1) << 21) |
+               (rm << 16) | ((Rnd() % 32) << 10) | (rn << 5) | rd;
+      case 2:  // ADD/ADDS/SUB/SUBS Wd, Wn, Wm, {U,S}XT{B,H,W,X} #0..4
+        return 0x0B200000U | (op << 30) | (s << 29) | (rm << 16) | ((Rnd() % 8) << 13) |
+               ((Rnd() % 5) << 10) | (rn << 5) | rd;
+      case 3:  // AND/ORR/EOR/ANDS Wd, Wn, #bitmask (32-bit element)
+        return 0x12000000U | ((Rnd() % 4) << 29) | ((Rnd() % 32) << 16) |
+               ((Rnd() % 31) << 10) | (rn << 5) | rd;
+      default: {  // LSL Wd, Wn, #shift == UBFM Wd, Wn, #(32-shift), #(31-shift)
+        uint32_t shift = 1 + Rnd() % 31;
+        return 0x53000000U | ((32 - shift) << 16) | ((31 - shift) << 10) | (rn << 5) | rd;
+      }
+    }
+  };
+  const int kIters = 3000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    int n = 1 + (Rnd() % 4);
+    uint32_t code[4];
+    for (int i = 0; i < n; i++) code[i] = gen();
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, n, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, kIters / 2) << "heavy accepted too few W-form ALU regions";
+}
+
 // Single-instruction AdvSIMD three-same integer, rd aliasing rn/rm sampled.
 TEST_F(Arm64HeavyDifferentialFuzz, NeonThreeSame) {
   Seed(0x3A3E5A3E90ABCDEFULL);
@@ -1121,6 +1221,71 @@ TEST_F(Arm64HeavyDifferentialFuzz, NeonVecXIdxSqdmull) {
   }
   EXPECT_GT(compared, 300) << "heavy accepted too few SQDMULL by-element encodings";
 }
+
+// region digitalis
+// Single-instruction AdvSIMD three-different long/wide forms, rd aliasing rn or
+// rm sampled, Q sampled: the "2" forms read the upper half of the narrow
+// sources, and a source that rd aliases must be read before rd is written.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonThreeDiffLong) {
+  Seed(0x3D1FF10C0FFEE123ULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t code[1] = {GenNeonThreeDiffLong()};
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 300) << "heavy accepted too few three-different long encodings";
+}
+
+// Regions of three-different long forms and widening shifts: a widened result
+// feeds the next instruction's narrow source.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonWideningRegion) {
+  Seed(0x51DE10C4A11BEEF0ULL);
+  const int kIters = 2000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t code[4];
+    for (auto& insn : code) {
+      insn = (Rnd() & 1) ? GenNeonThreeDiffLong() : GenNeonWidenShiftByImm();
+    }
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, 4, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 300) << "heavy accepted too few widening regions";
+}
+
+// SSHLL/USHLL and byte SSHR/USHR, Q sampled.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonWidenShiftByImm) {
+  Seed(0x55411E1D00C0FFEEULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    uint32_t code[1] = {GenNeonWidenShiftByImm()};
+    InitState in = RandomInit();
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+    }
+  }
+  EXPECT_GT(compared, 300) << "heavy accepted too few widening shift encodings";
+}
+// endregion
 
 // Single-instruction SHL-by-immediate across every size class the heavy tier
 // lowers (byte via PSLLW + per-byte AND mask, half/word/double via
@@ -2453,6 +2618,455 @@ TEST_F(Arm64HeavyDifferentialFuzz, Sha256) {
   }
   fprintf(stderr, "Sha256: compared=%d/%d\n", compared, kIters);
   EXPECT_GT(compared, 300) << "heavy accepted too few SHA-256 encodings";
+}
+
+// SHA-1 (SHA1C / SHA1P / SHA1M / SHA1SU0 / SHA1H / SHA1SU1) against the
+// interpreter, with fully random V-registers. The schedule updates (SU0, SU1)
+// are computed lane-parallel in the XMM domain, so rd aliasing rn or rm is
+// forced a quarter of the time each: a lowering that clobbers a source it
+// still reads only shows up when the registers alias.
+TEST_F(Arm64HeavyDifferentialFuzz, Sha1) {
+  Seed(0x5A1C0DE5ULL);
+  const int kIters = 3000 * FuzzScale();
+  struct Form {
+    uint32_t enc_base;  // rd/rn/rm inserted at [4:0],[9:5],[20:16]
+    bool three_reg;     // true: C/P/M/SU0 (has rm); false: H/SU1 (rd,rn only)
+  };
+  static const Form kForms[] = {
+      {0x5E000000u, true},   // sha1c   q0, s0, v0.4s
+      {0x5E001000u, true},   // sha1p   q0, s0, v0.4s
+      {0x5E002000u, true},   // sha1m   q0, s0, v0.4s
+      {0x5E003000u, true},   // sha1su0 v0.4s, v0.4s, v0.4s
+      {0x5E280800u, false},  // sha1h   s0, s0
+      {0x5E281800u, false},  // sha1su1 v0.4s, v0.4s
+  };
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    const Form& f = kForms[Rnd() % 6];
+    const int rd = Rnd() % 32;
+    int rn = Rnd() % 32;
+    int rm = Rnd() % 32;
+    if (Rnd() % 4 == 0) rn = rd;
+    if (Rnd() % 4 == 0) rm = rd;
+    uint32_t enc = f.enc_base | static_cast<uint32_t>(rd) | (static_cast<uint32_t>(rn) << 5);
+    if (f.three_reg) enc |= (static_cast<uint32_t>(rm) << 16);
+    uint32_t code[1] = {enc};
+    InitState in = RandomInit();  // random V-registers
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " enc=0x" << std::hex << enc << " " << desc;
+      break;
+    }
+  }
+  fprintf(stderr, "Sha1: compared=%d/%d\n", compared, kIters);
+  EXPECT_GT(compared, 300) << "heavy accepted too few SHA-1 encodings";
+}
+
+
+// SSHL / USHL (vector, .4H/.8H) against the interpreter. The heavy tier splits
+// each dword into its two halfwords, extends them, and shifts them with the
+// dword VPSxLVD forms, so the boundary counts around 16 (where a halfword
+// shift empties the lane while the dword shift does not) and the sign of the
+// extended value are what this corpus leans on.
+TEST_F(Arm64HeavyDifferentialFuzz, SshlUshlVector16) {
+  Seed(0x5A16E1ULL);
+  const int kIters = 4000 * FuzzScale();
+  static const int8_t kShifts[] = {0,  1,  7,   8,   15,  16,  17,  31,  32,  127,
+                                   -1, -7, -15, -16, -17, -31, -32, -127, -128};
+  constexpr int kNumShifts = sizeof(kShifts) / sizeof(kShifts[0]);
+  static const uint16_t kValues[] = {0x0000, 0x0001, 0x7FFF, 0x8000, 0xFFFF,
+                                     0x4000, 0xAAAA, 0x5555, 0x8001, 0x1234};
+  constexpr int kNumValues = sizeof(kValues) / sizeof(kValues[0]);
+
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    const bool is_signed = (Rnd() & 1) != 0;
+    const bool q = (Rnd() & 1) != 0;
+    const int rd = Rnd() % 32;
+    int rn = Rnd() % 32;
+    int rm = Rnd() % 32;
+    if (Rnd() % 4 == 0) rm = rn;  // same register as value and count
+    // Ground truth: 0x6e624420 == ushl v0.8h, v1.8h, v2.8h.
+    uint32_t code[1] = {static_cast<uint32_t>(
+        0x0E204400u | (q ? (1u << 30) : 0u) | (is_signed ? 0u : (1u << 29)) | (0b01u << 22) |
+        (static_cast<uint32_t>(rm) << 16) | (static_cast<uint32_t>(rn) << 5) |
+        static_cast<uint32_t>(rd))};
+
+    InitState in = RandomInit();
+    unsigned __int128 vn = 0, vm = 0;
+    for (int lane = 0; lane < 8; lane++) {
+      uint16_t value = (Rnd() % 3) ? kValues[Rnd() % kNumValues] : static_cast<uint16_t>(Rnd());
+      // Garbage in the high byte half the time: only bits [7:0] count.
+      uint16_t count = static_cast<uint8_t>(kShifts[Rnd() % kNumShifts]);
+      if (Rnd() & 1) count |= static_cast<uint16_t>((Rnd() & 0xFF) << 8);
+      vn |= static_cast<unsigned __int128>(value) << (16 * lane);
+      vm |= static_cast<unsigned __int128>(count) << (16 * lane);
+    }
+    in.v[rn] = vn;
+    if (rm != rn) in.v[rm] = vm;
+
+    std::string desc;
+    Result r = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+      break;
+    }
+  }
+  fprintf(stderr, "SshlUshlVector16: compared=%d/%d\n", compared, kIters);
+  EXPECT_GT(compared, 300) << "heavy accepted too few 16-bit SSHL/USHL encodings";
+}
+
+// FADDP (vector, .2S/.4S/.2D) against the interpreter, in single-instruction
+// and three-instruction regions (the .2S form gathers lanes with a PSHUFD after
+// HADDPS, so a stale upper half is the bug to catch). Inputs are finite, plus
+// signed zeros and values that overflow to infinity when added; NaN payloads
+// and inf - inf are left out because the ARM default NaN and x86's differ.
+TEST_F(Arm64HeavyDifferentialFuzz, FaddpVector) {
+  Seed(0xFADD9ULL);
+  const int kIters = 3000 * FuzzScale();
+  auto f32 = [&]() -> uint32_t {
+    static const uint32_t kSpecial[] = {0x00000000u, 0x80000000u, 0x7F7FFFFFu, 0x3F800000u,
+                                        0x00000001u, 0x80800000u};
+    if (Rnd() % 4 == 0) return kSpecial[Rnd() % 6];
+    float f = static_cast<float>(static_cast<int32_t>(Rnd() % 65536) - 32768) / 64.0f;
+    uint32_t b;
+    memcpy(&b, &f, 4);
+    return b;
+  };
+  auto f64 = [&]() -> uint64_t {
+    static const uint64_t kSpecial[] = {0x0ULL, 0x8000000000000000ULL, 0x7FEFFFFFFFFFFFFFULL,
+                                        0x3FF0000000000000ULL, 0x1ULL};
+    if (Rnd() % 4 == 0) return kSpecial[Rnd() % 5];
+    double d = static_cast<double>(static_cast<int64_t>(Rnd64() % 4194304) - 2097152) / 128.0;
+    uint64_t b;
+    memcpy(&b, &d, 8);
+    return b;
+  };
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    const int n = 1 + (Rnd() % 3);
+    uint32_t code[3];
+    // One lane width per region, so no instruction reads another width's bits
+    // as a NaN.
+    const uint32_t form = Rnd() % 3;  // 0: .2S, 1: .4S, 2: .2D
+    const uint32_t q = form == 0 ? 0 : 1;
+    const uint32_t sz = form == 2 ? 1 : 0;
+    for (int k = 0; k < n; k++) {
+      const uint32_t rd = Rnd() % 8, rn = Rnd() % 8, rm = Rnd() % 8;
+      // Ground truth: 0x6e22d420 == faddp v0.4s, v1.4s, v2.4s.
+      code[k] = 0x2E20D400u | (q << 30) | (sz << 22) | (rm << 16) | (rn << 5) | rd;
+    }
+    InitState in = RandomInit();
+    const bool is_double = sz != 0;
+    for (int i = 0; i < 8; i++) {
+      unsigned __int128 v = 0;
+      if (is_double) {
+        v = (static_cast<unsigned __int128>(f64()) << 64) | f64();
+      } else {
+        for (int lane = 0; lane < 4; lane++) {
+          v |= static_cast<unsigned __int128>(f32()) << (32 * lane);
+        }
+      }
+      in.v[i] = v;
+    }
+    std::string desc;
+    Result r = RunDifferential(code, n, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+      break;
+    }
+  }
+  fprintf(stderr, "FaddpVector: compared=%d/%d\n", compared, kIters);
+  EXPECT_GT(compared, 300) << "heavy accepted too few FADDP encodings";
+}
+
+// SQDMULH / SQRDMULH by element (.4H/.8H/.2S/.4S) against the interpreter.
+// Lanes are biased toward INT_MIN, INT_MAX, -1 and 1 so the doubling-overflow
+// saturation and the rounding carry are both exercised at every index.
+TEST_F(Arm64HeavyDifferentialFuzz, NeonVecXIdxSqdmulh) {
+  Seed(0x5D3C1D7ULL);
+  const int kIters = 5000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    const uint32_t opc = (Rnd() & 1) ? 0b1101u : 0b1100u;  // SQRDMULH : SQDMULH
+    const uint32_t q = Rnd() & 1;
+    const uint32_t size = 1 + (Rnd() & 1);
+    const uint32_t vm = Rnd() % 16;
+    const uint32_t rn = Rnd() % 16;
+    const uint32_t r = Rnd() % 3;
+    const uint32_t rd = r == 0 ? rn : (r == 1 ? vm : (Rnd() % 16));
+    uint32_t H, L, M;
+    if (size == 1) {
+      uint32_t index = Rnd() % 8;
+      H = index >> 2;
+      L = (index >> 1) & 1;
+      M = index & 1;
+    } else {
+      uint32_t index = Rnd() % 4;
+      H = index >> 1;
+      L = index & 1;
+      M = 0;
+    }
+    // Ground truth: 0x4f72d820 == sqrdmulh v0.8h, v1.8h, v2.h[7].
+    uint32_t code[1] = {(q << 30) | (0b01111u << 24) | (size << 22) | (L << 21) | (M << 20) |
+                        ((vm & 0xF) << 16) | (opc << 12) | (H << 11) | (rn << 5) | rd};
+    InitState in = RandomInit();
+    for (int i = 0; i < 16; i++) {
+      unsigned __int128 v = 0;
+      if (size == 1) {
+        static const uint16_t kH[] = {0x8000, 0x7FFF, 0xFFFF, 0x0001, 0x4000, 0xC000};
+        for (int lane = 0; lane < 8; lane++) {
+          uint16_t h = (Rnd() % 2) ? kH[Rnd() % 6] : static_cast<uint16_t>(Rnd());
+          v |= static_cast<unsigned __int128>(h) << (16 * lane);
+        }
+      } else {
+        static const uint32_t kS[] = {0x80000000u, 0x7FFFFFFFu, 0xFFFFFFFFu, 0x1u,
+                                      0x40000000u, 0xC0000000u};
+        for (int lane = 0; lane < 4; lane++) {
+          uint32_t w = (Rnd() % 2) ? kS[Rnd() % 6] : static_cast<uint32_t>(Rnd64());
+          v |= static_cast<unsigned __int128>(w) << (32 * lane);
+        }
+      }
+      in.v[i] = v;
+    }
+    std::string desc;
+    Result res = RunDifferential(code, 1, in, /*compare_fpsr=*/false, &desc);
+    if (res == kDeclined) continue;
+    compared++;
+    if (res == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " enc=0x" << std::hex << code[0] << " " << desc;
+      break;
+    }
+  }
+  fprintf(stderr, "NeonVecXIdxSqdmulh: compared=%d/%d\n", compared, kIters);
+  EXPECT_GT(compared, 300) << "heavy accepted too few SQDMULH by-element encodings";
+}
+
+// A B.cond right after its setter branches on the setter's host flags, but a
+// jump from elsewhere in the region to that B.cond arrives without them and
+// must test the stored NZCV: a forward CBZ over the setter, and a loop
+// back-edge whose flags come from another setter.
+TEST_F(Arm64HeavyDifferentialFuzz, JumpIntoFusedCondBranch) {
+  static const uint32_t kForward[] = {
+      0xB4000042U,  // cbz x2, 1f
+      0xEB01001FU,  // cmp x0, x1
+      0x54000040U,  // 1: b.eq 2f
+      0xD2800023U,  // movz x3, #1
+  };                // 2:
+  static const uint32_t kBackEdge[] = {
+      0xEB01001FU,  // cmp x0, x1
+      0x54000060U,  // 1: b.eq 2f
+      0xB1000400U,  // adds x0, x0, #1
+      0x17FFFFFEU,  // b 1b
+  };                // 2:
+  Seed(0x7A26E7F05EDB4A11ULL);
+  int compared = 0;
+  for (int iter = 0; iter < 400; iter++) {
+    InitState in = RandomInit();
+    std::string desc;
+    Result r;
+    if (iter % 2 == 0) {
+      in.x[2] = (Rnd() % 2) ? 0 : in.x[2] | 1;
+      if (Rnd() % 2) in.x[1] = in.x[0];
+      r = RunDifferential(kForward, 4, in, /*compare_fpsr=*/false, &desc);
+    } else {
+      in.x[0] = -static_cast<uint64_t>(1 + Rnd() % 40);
+      in.x[1] = (Rnd() % 2) ? in.x[0] : 7;
+      r = RunDifferential(kBackEdge, 4, in, /*compare_fpsr=*/false, &desc);
+    }
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) ADD_FAILURE() << "iter " << iter << " " << desc;
+  }
+  EXPECT_GT(compared, 300) << "heavy declined the jump-into-B.cond regions";
+}
+
+// Flag setters (ADDS/SUBS/ANDS/BICS/ADCS/SBCS/CMP/TST, immediate and register,
+// W and X) mixed with flag consumers (B.cond, CSEL, CSINC, CCMP, ADC) and
+// flag-clobbering x86 lowerings, inside straight-line regions and counted
+// loops. Every condition follows every setter, so a branch that reads the
+// setter's host flags instead of the stored NZCV is checked against the
+// interpreter, in the block, across blocks and around loop back-edges.
+TEST_F(Arm64HeavyDifferentialFuzz, FlagSettersAndConsumersRegion) {
+  auto gen_flag_mix = [&](int index, int n, bool in_loop) -> uint32_t {
+    uint32_t rd = Rnd() % 8, rn = Rnd() % 8, rm = Rnd() % 8;
+    uint32_t sf31 = static_cast<uint32_t>(Rnd() & 1) << 31;
+    uint32_t cond = Rnd() % 14;
+    switch (Rnd() % 16) {
+      case 0: return sf31 | 0x71000000U | ((Rnd() % 4096) << 10) | (rn << 5) | rd;  // subs imm
+      case 1: return sf31 | 0x31000000U | ((Rnd() % 4096) << 10) | (rn << 5) | rd;  // adds imm
+      case 2: return sf31 | 0x7100001FU | ((Rnd() % 8) << 10) | (rn << 5);          // cmp imm
+      case 3: return sf31 | 0x6B000000U | (rm << 16) | (rn << 5) | rd;               // subs reg
+      case 4: return sf31 | 0x2B000000U | (rm << 16) | (rn << 5) | rd;               // adds reg
+      case 5: return sf31 | 0x6A000000U | (rm << 16) | (rn << 5) | rd;               // ands reg
+      case 6: return sf31 | 0x6A200000U | (rm << 16) | (rn << 5) | rd;               // bics reg
+      case 7: return sf31 | (Rnd() % 2 ? 0x7A000000U : 0x3A000000U) | (rm << 16) | (rn << 5) | rd;  // sbcs/adcs
+      case 8: return sf31 | 0x6B00001FU | (rm << 16) | (rn << 5);                    // cmp reg
+      case 9: return sf31 | 0x1A800000U | (rm << 16) | (cond << 12) | (rn << 5) | rd;  // csel
+      case 10: return sf31 | 0x1A800400U | (rm << 16) | (cond << 12) | (rn << 5) | rd;  // csinc
+      case 11: return sf31 | 0x7A400000U | (rm << 16) | (cond << 12) | (rn << 5) | (Rnd() % 16);  // ccmp
+      case 12: return sf31 | 0x1A000000U | (rm << 16) | (rn << 5) | rd;               // adc
+      case 13: return sf31 | 0x1AC02000U | (rm << 16) | (rn << 5) | rd;               // lslv (clobbers EFLAGS)
+      default: {
+        // B.cond forward, at most to the loop's decrement or the region end.
+        int limit = in_loop ? n - 2 : n;
+        if (index + 1 >= limit) {
+          return sf31 | 0x0B000000U | (rm << 16) | (rn << 5) | rd;  // add
+        }
+        int target = index + 1 + static_cast<int>(Rnd() % (limit - index));
+        return 0x54000000U | (static_cast<uint32_t>(target - index) << 5) | cond;
+      }
+    }
+  };
+
+  Seed(0xF1A6B2A9C4D5E6F7ULL);
+  const int kIters = 6000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    bool in_loop = (Rnd() % 2) == 0;
+    int n = 4 + static_cast<int>(Rnd() % 16);
+    uint32_t code[20];
+    for (int i = 0; i < n; i++) code[i] = gen_flag_mix(i, n, in_loop);
+    if (in_loop) {
+      code[n - 2] = 0xF1000529U;                                            // subs x9, x9, #1
+      code[n - 1] = 0x54000001U | ((static_cast<uint32_t>(-(n - 1)) & 0x7FFFF) << 5);  // b.ne top
+    }
+    InitState in = RandomInit();
+    in.x[9] = 1 + Rnd() % 4;
+    std::string desc;
+    Result r = RunDifferential(code, n, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+      break;
+    }
+  }
+  EXPECT_GT(compared, 1000) << "heavy accepted too few flag regions";
+}
+
+// A setter, then a gap of instructions that leave the flags alone (SIMD, MOVZ,
+// MOV, ADD without flags) or not (LSLV clobbers EFLAGS), then a B.cond, CSEL or
+// loop back-edge on the setter's flags. A B.cond fused across the gap tests the
+// setter's host flags, and the NZCV it stores in each successor must match.
+TEST_F(Arm64HeavyDifferentialFuzz, FlagSettersAcrossGapRegion) {
+  auto gen_setter = [&]() -> uint32_t {
+    uint32_t rd = Rnd() % 8, rn = Rnd() % 8, rm = Rnd() % 8;
+    uint32_t sf31 = static_cast<uint32_t>(Rnd() & 1) << 31;
+    switch (Rnd() % 5) {
+      case 0: return sf31 | 0x71000000U | ((Rnd() % 4096) << 10) | (rn << 5) | rd;  // subs imm
+      case 1: return sf31 | 0x2B000000U | (rm << 16) | (rn << 5) | rd;               // adds reg
+      case 2: return sf31 | 0x6A000000U | (rm << 16) | (rn << 5) | rd;               // ands reg
+      case 3: return sf31 | 0x7100001FU | ((Rnd() % 8) << 10) | (rn << 5);          // cmp imm
+      default: return sf31 | 0x6B00001FU | (rm << 16) | (rn << 5);                   // cmp reg
+    }
+  };
+  auto gen_gap = [&]() -> uint32_t {
+    uint32_t rd = Rnd() % 8, rn = Rnd() % 8, rm = Rnd() % 8;
+    uint32_t vd = Rnd() % 32, vn = Rnd() % 32, vm = Rnd() % 32;
+    switch (Rnd() % 8) {
+      case 0: return 0x4EA08400U | (vm << 16) | (vn << 5) | vd;          // add v.4s
+      case 1: return 0x4EA01C00U | (vm << 16) | (vn << 5) | vd;          // orr v.16b
+      case 2: return 0x4E602800U | (vn << 5) | vd;                       // saddlp v.4s, v.8h
+      case 3: return 0x4EA0BC00U | (vm << 16) | (vn << 5) | vd;          // addp v.4s
+      case 4: return 0xD2800000U | ((Rnd() % 65536) << 5) | rd;          // movz
+      case 5: return 0xAA0003E0U | (rm << 16) | rd;                      // mov
+      case 6: return 0x91000000U | ((Rnd() % 4096) << 10) | (rn << 5) | rd;  // add imm
+      default: return 0x9AC02000U | (rm << 16) | (rn << 5) | rd;         // lslv (clobbers EFLAGS)
+    }
+  };
+
+  Seed(0x36A9C0DE5EED6A70ULL);
+  const int kIters = 3000 * FuzzScale();
+  int compared = 0;
+  for (int iter = 0; iter < kIters; iter++) {
+    bool in_loop = (Rnd() % 2) == 0;
+    uint32_t code[32];
+    int n = 0;
+    int groups = 1 + static_cast<int>(Rnd() % 3);
+    for (int g = 0; g < groups; g++) {
+      code[n++] = gen_setter();
+      int gap = static_cast<int>(Rnd() % 6);
+      for (int i = 0; i < gap; i++) code[n++] = gen_gap();
+      uint32_t cond = Rnd() % 14;
+      if (Rnd() % 2) {
+        // B.cond over the next instruction.
+        code[n++] = 0x54000040U | cond;
+        code[n++] = gen_gap();
+      } else {
+        uint32_t rd = Rnd() % 8, rn = Rnd() % 8, rm = Rnd() % 8;
+        code[n++] = 0x9A800000U | (rm << 16) | (cond << 12) | (rn << 5) | rd;  // csel
+      }
+    }
+    if (in_loop) {
+      code[n++] = 0xF1000529U;  // subs x9, x9, #1
+      int gap = static_cast<int>(Rnd() % 4);
+      for (int i = 0; i < gap; i++) code[n++] = gen_gap();
+      code[n] = 0x54000001U | ((static_cast<uint32_t>(-n) & 0x7FFFF) << 5);  // b.ne top
+      n++;
+    }
+    InitState in = RandomInit();
+    in.x[9] = 1 + Rnd() % 4;
+    std::string desc;
+    Result r = RunDifferential(code, n, in, /*compare_fpsr=*/false, &desc);
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) {
+      ADD_FAILURE() << "iter " << iter << " " << desc;
+      break;
+    }
+  }
+  EXPECT_GT(compared, 1000) << "heavy accepted too few gap regions";
+}
+
+// A jump into the gap between a setter and its fused B.cond arrives without
+// the setter's host flags, so it must not reach the B.cond's PseudoCondBranch:
+// a forward CBZ over the setter, and a loop back-edge from a later setter.
+TEST_F(Arm64HeavyDifferentialFuzz, JumpIntoFusedCondBranchGap) {
+  static const uint32_t kForward[] = {
+      0xB4000062U,  // cbz x2, 1f
+      0xEB01001FU,  // cmp x0, x1
+      0x4EA28420U,  // add v0.4s, v1.4s, v2.4s
+      0xD28000A4U,  // 1: movz x4, #5
+      0x54000040U,  // b.eq 2f
+      0xD2800023U,  // movz x3, #1
+  };                // 2:
+  static const uint32_t kBackEdge[] = {
+      0xEB01001FU,  // cmp x0, x1
+      0x4EA18400U,  // 1: add v0.4s, v0.4s, v1.4s
+      0x54000060U,  // b.eq 2f
+      0xB1000400U,  // adds x0, x0, #1
+      0x17FFFFFDU,  // b 1b
+  };                // 2:
+  Seed(0x36D1A6E0F00DCAFEULL);
+  int compared = 0;
+  for (int iter = 0; iter < 400; iter++) {
+    InitState in = RandomInit();
+    std::string desc;
+    Result r;
+    if (iter % 2 == 0) {
+      in.x[2] = (Rnd() % 2) ? 0 : in.x[2] | 1;
+      if (Rnd() % 2) in.x[1] = in.x[0];
+      r = RunDifferential(kForward, 6, in, /*compare_fpsr=*/false, &desc,
+                          /*interpret_after_exit=*/true);
+    } else {
+      in.x[0] = -static_cast<uint64_t>(1 + Rnd() % 40);
+      in.x[1] = (Rnd() % 2) ? in.x[0] : 7;
+      r = RunDifferential(kBackEdge, 5, in, /*compare_fpsr=*/false, &desc,
+                          /*interpret_after_exit=*/true);
+    }
+    if (r == kDeclined) continue;
+    compared++;
+    if (r == kDiverge) ADD_FAILURE() << "iter " << iter << " " << desc;
+  }
+  EXPECT_GT(compared, 300) << "heavy declined the jump-into-gap regions";
 }
 
 }  // namespace berberis

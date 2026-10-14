@@ -17,9 +17,11 @@
 #ifndef BERBERIS_LITE_TRANSLATOR_ARM64_TO_X86_64_H_
 #define BERBERIS_LITE_TRANSLATOR_ARM64_TO_X86_64_H_
 
+#include <bitset>
 #include <cstdint>
 #include <tuple>
 #include <unordered_map>
+#include <vector>
 
 #include "berberis/assembler/common.h"
 #include "berberis/assembler/x86_64.h"
@@ -54,6 +56,7 @@ class LiteTranslator {
       : as_(machine_code),
         success_(true),
         pc_(pc),
+        start_pc_(pc),
         params_(params),
         is_region_end_reached_(false),
         // track whether any SIMD/FP register was allocated.
@@ -61,7 +64,9 @@ class LiteTranslator {
         // MXCSR -> FPSR mirror at region exit can be elided. Integer-only hot
         // loops (e.g. bionic linker CdEntryMapZip32::AddToMap hash probe) hit
         // 9+ region exits per iteration; eliding the 12-x86-insn mirror saves
-        // ~100 host insns per iteration there.
+        // ~100 host insns per iteration there. Instructions that only move
+        // SIMD/FP data (NonRaisingSimdScope) don't count, so a region of
+        // integer work plus vector loads, stores and permutes elides it too.
         fp_dirty_(false)
         {}
 
@@ -139,18 +144,7 @@ class LiteTranslator {
     return result;
   }
 
-  void StoreMappedRegs() {
-    if (!IsRegMappingEnabled()) {
-      return;
-    }
-    for (unsigned i = 0; i < kNumGuestRegs; i++) {
-      if (gp_maintainer_.IsModified(i)) {
-        auto mapped_reg = gp_maintainer_.GetMapped(i);
-        int32_t offset = offsetof(ThreadState, cpu.x[0]) + i * 8;
-        as_.Movq({.base = Assembler::rbp, .disp = offset}, mapped_reg);
-      }
-    }
-  }
+  void StoreMappedRegs() { StoreMappedRegs(ModifiedMappedRegs()); }
 
   //
   // Region exit methods.
@@ -159,6 +153,21 @@ class LiteTranslator {
   void ExitGeneratedCode(GuestAddr target);
   void ExitRegion(GuestAddr target);
   void ExitRegionIndirect(Register target);
+
+  // Binds recovery_label (the fault handler of the memory access just emitted)
+  // to an exit to the current guest instruction. The exit stub goes out of
+  // line, after the region's last exit (EmitRecoveryExits), so the fault-free
+  // path falls through the access instead of jumping over an inline stub after
+  // every load and store. The stub flushes the mapped registers modified so
+  // far and mirrors MXCSR if FP work happened so far: exactly what an inline
+  // ExitGeneratedCode(GetInsnAddr()) at this point would emit.
+  void AddRecoveryExit(AssemblerBase::Label* recovery_label) {
+    recovery_exits_.push_back({recovery_label, GetInsnAddr(), ModifiedMappedRegs(), fp_dirty_});
+  }
+
+  // Emits the stubs AddRecoveryExit deferred. Call once, after the region's
+  // final exit, before finalizing the assembler.
+  void EmitRecoveryExits();
 
   // Mirror host MXCSR cumulative exception bits into emulated_fpsr at ARM FPSR
   // positions. Called from every region-exit path: System V x86_64 ABI lets
@@ -215,12 +224,67 @@ class LiteTranslator {
     simd_allocator_.FreeTemps();
   }
 
-  // Backward-branch inlining (a per-PC label map + local jumps for in-region
-  // loops) was removed: it traps the CPU in a tight loop without signal
-  // checks, and an in-region back-edge variant also miscompiled codec loops.
-  // Backward edges always exit the region so signals are processed.
+  // In-region self-loops (LiteTranslateParams::allow_in_region_loops).
+  //
+  // An earlier backward-branch inlining (a per-PC label map + local jumps)
+  // was removed: it looped without signal checks, and its back-edge variant
+  // miscompiled codec loops. Two things make a back-edge safe here:
+  //  - every iteration checks pending signals and exits through dispatch when
+  //    one is pending, as every region exit does;
+  //  - the loop head sees the register state the back-edge leaves. A first
+  //    pass records the region's final guest-register mappings, modified set
+  //    and fp_dirty_; the looping pass maps and loads all those registers
+  //    before the head and marks the modified ones, so no lazy first-use load
+  //    re-reads stale ThreadState in a later iteration, and every exit and
+  //    recovery stub stores what any iteration may have changed. A back-edge
+  //    reached after a new mapping (state differing from the head's) exits.
+  struct LoopEntryState {
+    std::bitset<kNumGuestRegs> mapped;
+    std::bitset<kNumGuestRegs> modified;
+    bool fp_dirty = false;
+  };
+
+  [[nodiscard]] bool saw_self_back_edge() const { return saw_self_back_edge_; }
+
+  [[nodiscard]] LoopEntryState CaptureLoopEntryState() {
+    LoopEntryState state;
+    for (unsigned i = 0; i < kNumGuestRegs; i++) {
+      state.mapped[i] = gp_maintainer_.IsMapped(i);
+    }
+    state.modified = ModifiedMappedRegs();
+    state.fp_dirty = fp_dirty_;
+    return state;
+  }
+
+  // Emits the preload for state and binds the loop head after it. Call
+  // before translating the region's first instruction.
+  void EmitLoopHead(const LoopEntryState& state);
+
+  // Exit for a direct branch: loops to the head when target is the region
+  // start (see above), else ExitRegion.
+  void ExitRegionOrLoop(GuestAddr target);
 
   bool IsRegMappingEnabled() { return params_.enable_reg_mapping; }
+
+  std::bitset<kNumGuestRegs> ModifiedMappedRegs() {
+    std::bitset<kNumGuestRegs> modified;
+    if (IsRegMappingEnabled()) {
+      for (unsigned i = 0; i < kNumGuestRegs; i++) {
+        modified[i] = gp_maintainer_.IsModified(i);
+      }
+    }
+    return modified;
+  }
+
+  void StoreMappedRegs(const std::bitset<kNumGuestRegs>& modified) {
+    for (unsigned i = 0; i < kNumGuestRegs; i++) {
+      if (modified[i]) {
+        auto mapped_reg = gp_maintainer_.GetMapped(i);
+        int32_t offset = offsetof(ThreadState, cpu.x[0]) + i * 8;
+        as_.Movq({.base = Assembler::rbp, .disp = offset}, mapped_reg);
+      }
+    }
+  }
 
   std::tuple<Register, bool> GetMappedRegisterOrMap(int reg) {
     if (gp_maintainer_.IsMapped(reg)) {
@@ -228,6 +292,9 @@ class LiteTranslator {
     }
     if (auto alloc_result = gp_allocator_.Alloc()) {
       gp_maintainer_.Map(reg, alloc_result.value());
+      if (loop_head_ != nullptr) {
+        mapped_after_loop_head_ = true;
+      }
       return {alloc_result.value(), true};
     }
     success_ = false;
@@ -244,8 +311,11 @@ class LiteTranslator {
 
   SimdRegister AllocTempSimdReg() {
     // any SIMD/FP work in the region marks MXCSR as
-    // possibly-dirty so the mirror at region exit isn't elided.
-    fp_dirty_ = true;
+    // possibly-dirty so the mirror at region exit isn't elided, except in an
+    // instruction that only moves data (see NonRaisingSimdScope).
+    if (!in_non_raising_simd_insn_) {
+      fp_dirty_ = true;
+    }
     if (auto reg_option = simd_allocator_.AllocTemp()) {
       return reg_option.value();
     }
@@ -401,6 +471,32 @@ class LiteTranslator {
   // through AllocTempSimdReg (e.g. a future scalar FP path that directly uses
   // a fixed XMM register). Currently unused; kept for forward use.
   void MarkFpDirty() { fp_dirty_ = true; }
+
+  // Wraps the translation of an instruction whose host lowering only moves
+  // data: SIMD/FP loads and stores, lane and register moves, immediates,
+  // permutes, EXT and TBL. None of the x86 instructions these emit (moves,
+  // inserts and extracts, shuffles, integer packs/compares/logic) can set an
+  // MXCSR exception flag, so their temp SIMD registers leave the region's
+  // FP-dirty bit alone. A region that does nothing else keeps the
+  // MXCSR -> FPSR mirror elided, like an integer-only region. Instructions
+  // that can raise (FP arithmetic, compares, conversions, rounding) must not
+  // use this scope.
+  class NonRaisingSimdScope {
+   public:
+    // `active` false makes the scope a no-op, for handlers where only some
+    // encodings just move data.
+    explicit NonRaisingSimdScope(LiteTranslator* translator, bool active = true)
+        : translator_(translator), saved_(translator->in_non_raising_simd_insn_) {
+      translator_->in_non_raising_simd_insn_ = saved_ || active;
+    }
+    ~NonRaisingSimdScope() { translator_->in_non_raising_simd_insn_ = saved_; }
+    NonRaisingSimdScope(const NonRaisingSimdScope&) = delete;
+    NonRaisingSimdScope& operator=(const NonRaisingSimdScope&) = delete;
+
+   private:
+    LiteTranslator* translator_;
+    bool saved_;
+  };
   bool fp_dirty() const { return fp_dirty_; }
 
  private:
@@ -610,6 +706,7 @@ class LiteTranslator {
   Assembler as_;
   bool success_;
   GuestAddr pc_;
+  const GuestAddr start_pc_;
   Allocator<Register> gp_allocator_;
   RegisterFileMaintainer<Register, kNumGuestRegs> gp_maintainer_;
   Allocator<SimdRegister> simd_allocator_;
@@ -617,7 +714,21 @@ class LiteTranslator {
   bool is_region_end_reached_;
   // see constructor comment.
   bool fp_dirty_;
-  // guest PC label map for backward branch inlining
+  // Set while a NonRaisingSimdScope is open.
+  bool in_non_raising_simd_insn_ = false;
+  // Fault exits deferred by AddRecoveryExit, with the state captured at the
+  // faulting access.
+  struct RecoveryExit {
+    AssemblerBase::Label* label;
+    GuestAddr pc;
+    std::bitset<kNumGuestRegs> modified;
+    bool fp_dirty;
+  };
+  std::vector<RecoveryExit> recovery_exits_;
+  // In-region loop state (see LoopEntryState).
+  Assembler::Label* loop_head_ = nullptr;
+  bool mapped_after_loop_head_ = false;
+  bool saw_self_back_edge_ = false;
 };
 
 }  // namespace berberis

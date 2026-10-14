@@ -22,7 +22,15 @@
 #include <iterator>
 #include <limits>
 
+#include <sys/mman.h>
+#include <unistd.h>
+
 #include "berberis/assembler/machine_code.h"
+#include "berberis/backend/x86_64/code_gen.h"
+#include "berberis/backend/x86_64/machine_ir.h"
+#include "berberis/base/arena_alloc.h"
+#include "berberis/decoder/arm64/decoder.h"
+#include "berberis/decoder/arm64/semantics_player.h"
 #include "berberis/guest_state/guest_addr.h"
 #include "berberis/guest_state/guest_state.h"
 #include "berberis/heavy_optimizer/arm64/heavy_optimize_region.h"
@@ -30,6 +38,8 @@
 #include "berberis/runtime_primitives/translation_cache.h"
 #include "berberis/test_utils/scoped_exec_region.h"
 #include "berberis/test_utils/testing_run_generated_code.h"
+
+#include "frontend.h"
 
 namespace berberis {
 
@@ -666,33 +676,53 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, MoveWideThenBailRegion) {
   EXPECT_EQ(n, 2u);
 }
 
-// A single guest instruction whose decode fires several listener callbacks where
-// a later one bails must still produce valid IR (one region exit, no trailing
-// insns) — i.e. GenCode must not abort. A SIMD LDP-Q post-index decodes to
-// SimdLoadStorePair (still bails this round) followed by an AddImm writeback;
-// once SimdLoadStorePair sets success_ = false the AddImm must emit nothing.
+// A single guest instruction whose semantics fire several listener callbacks
+// where an earlier one bails must still produce valid IR (one region exit, no
+// trailing insns) -- i.e. GenCode must not abort. A post-index access calls the
+// load/store callback and then AddImm for the writeback; once the access bails
+// (success_ = false) the AddImm and SetReg must emit nothing. Every SIMD and
+// integer post-index form now lowers, so the bail is driven through the
+// frontend directly with the same callback order SemanticsPlayer uses.
+void EmitBailThenWriteback(HeavyOptimizerFrontend* frontend) {
+  frontend->StartInsn();
+  auto base = frontend->GetReg(1);
+  frontend->Undefined();  // the access bails
+  auto new_base = frontend->AddImm(base, 2);
+  frontend->SetReg(1, new_base);
+}
+
 TEST_F(Arm64HeavyOptimizerFrontendTest, MultiCallbackBailIsValidIR) {
-  // LDR H0, [X1], #2 (SIMD 16-bit post-index): SimdLoadStoreImm (bails on the
-  // H/B sizes) then the writeback callback -- a multi-callback bail.
-  static const uint32_t code[] = {0x7c402420};
-  state_.cpu.insn_addr = ToGuestAddr(code);
+  static const uint32_t code[] = {0xd503201f /*NOP*/};
+  Arena arena;
+  x86_64::MachineIR machine_ir(&arena);
+  HeavyOptimizerFrontend frontend(&machine_ir, ToGuestAddr(code));
+  EmitBailThenWriteback(&frontend);
+  EXPECT_FALSE(frontend.success());
+  frontend.Finalize(frontend.GetInsnAddr());
   MachineCode mc;
   // No abort here is the assertion (GenCode runs CheckMachineIR internally).
-  auto [stop, ok, n] = HeavyOptimizeRegion(
-      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
-  EXPECT_FALSE(ok);
-  EXPECT_EQ(n, 0u);
+  x86_64::GenCode(&machine_ir, &mc);
 }
 
 // MoveWide followed by a multi-callback bail (the common on-device prefix shape).
 TEST_F(Arm64HeavyOptimizerFrontendTest, MoveWideThenMultiCallbackBail) {
-  static const uint32_t code[] = {MovzX(0, 0x11),
-                                  0x7c402420 /*LDR H0,[X1],#2 SIMD 16-bit post-index, bails*/};
-  state_.cpu.insn_addr = ToGuestAddr(code);
+  static const uint32_t code[] = {MovzX(0, 0x11), 0xd503201f /*NOP*/};
+  Arena arena;
+  x86_64::MachineIR machine_ir(&arena);
+  HeavyOptimizerFrontend frontend(&machine_ir, ToGuestAddr(code));
+  SemanticsPlayer sem_player(&frontend);
+  Decoder decoder(&sem_player);
+  frontend.StartInsn();
+  auto size = decoder.Decode(ToHostAddr<const uint16_t>(frontend.GetInsnAddr()));
+  ASSERT_TRUE(frontend.success());
+  frontend.IncrementInsnAddr(size);
+  EmitBailThenWriteback(&frontend);
+  EXPECT_FALSE(frontend.success());
+  // The region stops after the MOVZ, which translated.
+  EXPECT_EQ(frontend.GetInsnAddr(), ToGuestAddr(code) + sizeof(code[0]));
+  frontend.Finalize(frontend.GetInsnAddr());
   MachineCode mc;
-  auto [stop, ok, n] = HeavyOptimizeRegion(
-      ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = ToGuestAddr(code) + sizeof(code)});
-  EXPECT_EQ(n, 1u);  // the MOVZ translated; the SIMD pair load bailed without corrupting IR
+  x86_64::GenCode(&machine_ir, &mc);
 }
 
 //
@@ -2291,6 +2321,150 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, BranchCondAlwaysTaken) {
   EXPECT_EQ(state_.cpu.x[9], 0u);
 }
 
+// Every B.cond condition against every NZCV value, seeded straight into
+// cpu.flags, checked against the architectural ConditionHolds table. Pins the
+// direct NZCV tests EmitCondBranch emits (TEST, AND+CMP, and the (flags << 15)
+// ^ flags fold for the signed conditions).
+bool ArmConditionHolds(uint8_t cond, bool n, bool z, bool c, bool v) {
+  bool result = false;
+  switch (cond >> 1) {
+    case 0: result = z; break;              // EQ / NE
+    case 1: result = c; break;              // CS / CC
+    case 2: result = n; break;              // MI / PL
+    case 3: result = v; break;              // VS / VC
+    case 4: result = c && !z; break;        // HI / LS
+    case 5: result = n == v; break;         // GE / LT
+    case 6: result = !z && n == v; break;   // GT / LE
+  }
+  return (cond & 1) ? !result : result;
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, BranchCondAllConditionsAllFlags) {
+  for (uint8_t cond = kCondEQ; cond < kCondAL; ++cond) {
+    const uint32_t code[] = {
+        Bcond(cond, 8),  // [0] B.cond -> skip [1] when taken
+        MovzX(9, 1),     // [1] runs only on fall-through
+        MovzX(10, 2),    // [2]
+    };
+    GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+    MachineCode mc;
+    auto [stop, ok, n] =
+        HeavyOptimizeRegion(ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = end_pc});
+    ASSERT_TRUE(ok);
+    ScopedExecRegion exec(&mc);
+    for (uint8_t nzcv = 0; nzcv < 16; ++nzcv) {
+      bool fn = nzcv & 8, fz = nzcv & 4, fc = nzcv & 2, fv = nzcv & 1;
+      state_.cpu.x[9] = 0;
+      state_.cpu.x[10] = 0;
+      state_.cpu.flags = (fn ? CPUState::kFlagNegative : 0) | (fz ? CPUState::kFlagZero : 0) |
+                         (fc ? CPUState::kFlagCarry : 0) | (fv ? CPUState::kFlagOverflow : 0);
+      state_.cpu.insn_addr = ToGuestAddr(code);
+      TestingRunGeneratedCode(&state_, exec.get(), end_pc);
+      bool taken = state_.cpu.x[9] == 0;
+      EXPECT_EQ(taken, ArmConditionHolds(cond, fn, fz, fc, fv))
+          << "cond=" << int{cond} << " nzcv=" << int{nzcv};
+      EXPECT_EQ(state_.cpu.x[10], 2u);
+    }
+  }
+}
+
+// Every B.cond condition directly after SUBS, ADDS and ANDS (X and W forms),
+// which branches on the host flags the setter left instead of reloading
+// cpu.flags, over operands at the carry, overflow, sign and zero edges. The
+// branch must agree with ConditionHolds on the architectural NZCV, and both
+// paths must still store that NZCV in cpu.flags.
+struct FlagSetterCase {
+  uint32_t insn;  // Rd = X2, Rn = X0, Rm = X1
+  bool is_64bit;
+  enum { kSub, kAdd, kAnd } op;
+};
+
+uint16_t ExpectedNZCV(const FlagSetterCase& setter, uint64_t a, uint64_t b) {
+  const int bits = setter.is_64bit ? 64 : 32;
+  const uint64_t mask = setter.is_64bit ? ~uint64_t{0} : uint64_t{0xffff'ffff};
+  a &= mask;
+  b &= mask;
+  uint64_t result;
+  bool c = false, v = false;
+  const uint64_t sign = uint64_t{1} << (bits - 1);
+  switch (setter.op) {
+    case FlagSetterCase::kSub:
+      result = (a - b) & mask;
+      c = a >= b;
+      v = ((a ^ b) & (a ^ result) & sign) != 0;
+      break;
+    case FlagSetterCase::kAdd:
+      result = (a + b) & mask;
+      c = result < a;
+      v = (~(a ^ b) & (a ^ result) & sign) != 0;
+      break;
+    case FlagSetterCase::kAnd:
+      result = a & b;
+      break;
+  }
+  return ((result & sign) ? CPUState::kFlagNegative : 0) | (result == 0 ? CPUState::kFlagZero : 0) |
+         (c ? CPUState::kFlagCarry : 0) | (v ? CPUState::kFlagOverflow : 0);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, BranchCondOnSetterHostFlags) {
+  const FlagSetterCase setters[] = {
+      {SubsRegX(2, 0, 1), true, FlagSetterCase::kSub},
+      {AddsRegX(2, 0, 1), true, FlagSetterCase::kAdd},
+      {AndsRegX(2, 0, 1), true, FlagSetterCase::kAnd},
+      {SubsRegW(2, 0, 1), false, FlagSetterCase::kSub},
+      {AddsRegW(2, 0, 1), false, FlagSetterCase::kAdd},
+  };
+  const uint64_t values[] = {0,
+                             1,
+                             5,
+                             0x7fff'ffff,
+                             0x8000'0000,
+                             0xffff'ffff,
+                             0x7fff'ffff'ffff'ffff,
+                             0x8000'0000'0000'0000,
+                             0xffff'ffff'ffff'ffff};
+  for (const auto& setter : setters) {
+    for (uint8_t cond = kCondEQ; cond < kCondAL; ++cond) {
+      const uint32_t code[] = {
+          setter.insn,     // [0] flag setter
+          Bcond(cond, 8),  // [1] B.cond -> skip [2] when taken
+          MovzX(9, 1),     // [2] runs only on fall-through
+          MovzX(10, 2),    // [3]
+      };
+      GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+      MachineCode mc;
+      auto [stop, ok, n] =
+          HeavyOptimizeRegion(ToGuestAddr(code), &mc, HeavyOptimizeParams{.end_pc = end_pc});
+      ASSERT_TRUE(ok);
+      ScopedExecRegion exec(&mc);
+      for (uint64_t a : values) {
+        for (uint64_t b : values) {
+          state_.cpu.x[0] = a;
+          state_.cpu.x[1] = b;
+          state_.cpu.x[9] = 0;
+          state_.cpu.x[10] = 0;
+          state_.cpu.flags = 0;
+          state_.cpu.insn_addr = ToGuestAddr(code);
+          TestingRunGeneratedCode(&state_, exec.get(), end_pc);
+          const uint16_t nzcv = ExpectedNZCV(setter, a, b);
+          EXPECT_EQ(state_.cpu.flags & kFlagsNZCVMask, nzcv)
+              << "insn=" << std::hex << setter.insn << " a=" << a << " b=" << b;
+          bool taken = state_.cpu.x[9] == 0;
+          EXPECT_EQ(taken,
+                    ArmConditionHolds(cond,
+                                      nzcv & CPUState::kFlagNegative,
+                                      nzcv & CPUState::kFlagZero,
+                                      nzcv & CPUState::kFlagCarry,
+                                      nzcv & CPUState::kFlagOverflow))
+              << "insn=" << std::hex << setter.insn << " cond=" << int{cond} << " a=" << a
+              << " b=" << b;
+          EXPECT_EQ(state_.cpu.x[10], 2u);
+        }
+      }
+    }
+  }
+}
+
 // CBZ taken: X0 == 0 -> branch over code[2].
 TEST_F(Arm64HeavyOptimizerFrontendTest, CompareAndBranchCbzTaken) {
   static const uint32_t code[] = {
@@ -3259,6 +3433,79 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, Ld2WrapV31) {
     EXPECT_EQ(r31[l], buf[l * 2 + 0]);
     EXPECT_EQ(r0[l], buf[l * 2 + 1]);
   }
+}
+
+// Every interleaved LDn/STn layout (n = 2..4, every element size, Q=0 and
+// Q=1) against the element order: memory element e is register (e % n), lane
+// (e / n). The data ends at a PROT_NONE page, so a load or store past the
+// structures faults, and guard bytes before the data catch a store before
+// them. The register list starts at v30, so n >= 3 wraps to v0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, InterleavedStructAllLayouts) {
+  const size_t page = sysconf(_SC_PAGESIZE);
+  auto* mem = static_cast<uint8_t*>(
+      mmap(nullptr, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+  ASSERT_NE(mem, MAP_FAILED);
+  ASSERT_EQ(mprotect(mem + page, page, PROT_NONE), 0);
+  const struct {
+    uint8_t op;
+    int n;
+  } kForms[] = {{kLd2Op, 2}, {kLd3Op, 3}, {kLd4Op, 4}};
+  constexpr uint8_t kRt = 30;
+  for (auto form : kForms) {
+    for (uint8_t size = 0; size < 4; size++) {
+      for (bool q : {false, true}) {
+        if (size == 3 && !q) {
+          continue;  // Reserved encoding.
+        }
+        SCOPED_TRACE(testing::Message() << "n=" << form.n << " size=" << int{size} << " q=" << q);
+        const int esize = 1 << size;
+        const int vec_bytes = q ? 16 : 8;
+        const int total = form.n * vec_bytes;
+        uint8_t* data = mem + page - total;
+        auto mem_byte_of = [&](int r, int b) { return ((b / esize) * form.n + r) * esize + b % esize; };
+
+        for (int i = 0; i < total; i++) {
+          data[i] = static_cast<uint8_t>(i * 13 + size * 7 + form.n);
+        }
+        for (int r = 0; r < 4; r++) {
+          std::memset(&state_.cpu.v[(kRt + r) & 31], 0xA5, 16);
+        }
+        const uint32_t load[] = {AdvSimdMultiEnc(q, false, true, 0, form.op, size, 1, kRt)};
+        state_.cpu.x[1] = ToGuestAddr(data);
+        state_.cpu.insn_addr = ToGuestAddr(load);
+        ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(load) + sizeof(load)));
+        for (int r = 0; r < form.n; r++) {
+          uint8_t got[16];
+          std::memcpy(got, &state_.cpu.v[(kRt + r) & 31], 16);
+          for (int b = 0; b < 16; b++) {
+            EXPECT_EQ(got[b], b < vec_bytes ? data[mem_byte_of(r, b)] : 0) << "r=" << r << " b=" << b;
+          }
+        }
+
+        uint8_t regs[4][16];
+        for (int r = 0; r < form.n; r++) {
+          for (int b = 0; b < 16; b++) {
+            regs[r][b] = static_cast<uint8_t>(0x40 * r + b * 3 + 1);
+          }
+          std::memcpy(&state_.cpu.v[(kRt + r) & 31], regs[r], 16);
+        }
+        std::memset(data - 16, 0x5A, 16 + total);
+        const uint32_t store[] = {AdvSimdMultiEnc(q, false, false, 0, form.op, size, 1, kRt)};
+        state_.cpu.x[1] = ToGuestAddr(data);
+        state_.cpu.insn_addr = ToGuestAddr(store);
+        ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(store) + sizeof(store)));
+        for (int i = -16; i < 0; i++) {
+          EXPECT_EQ(data[i], 0x5A) << "guard " << i;
+        }
+        for (int r = 0; r < form.n; r++) {
+          for (int b = 0; b < vec_bytes; b++) {
+            EXPECT_EQ(data[mem_byte_of(r, b)], regs[r][b]) << "r=" << r << " b=" << b;
+          }
+        }
+      }
+    }
+  }
+  munmap(mem, 2 * page);
 }
 
 // AdvSIMD load/store SINGLE structure: LD1R (replicate), single-element LD1 /
@@ -6851,6 +7098,85 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, FminnmNaNSuppressesD) {
   ASSERT_TRUE(ok);
   EXPECT_DOUBLE_EQ(GetVf64(&state_, 0), -5.0);
   EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// Scalar FMAX/FMIN/FMAXNM/FMINNM order signed zeros whatever the operand
+// order: the min forms return -0 and the max forms +0 for (+-0, -+0).
+TEST_F(Arm64HeavyOptimizerFrontendTest, FpMinMaxScalarSignedZeros) {
+  // FMAX/FMIN/FMAXNM/FMINNM d0, d1, d2 (ftype S); the opcode is bits 15:12.
+  constexpr uint32_t kOps[4] = {FmaxS(0, 1, 2), FminS(0, 1, 2), FmaxnmS(0, 1, 2), FminnmS(0, 1, 2)};
+  // ftype bits 23:22 and the sign bit of each width: H (F16C hosts), S, D.
+  struct Width {
+    uint32_t ftype;
+    uint64_t sign;
+  };
+  constexpr Width kWidths[3] = {{0x00c00000, 0x8000}, {0, 0x80000000u}, {0x00400000, 1ull << 63}};
+  for (const Width& w : kWidths) {
+    if (w.ftype == 0x00c00000 && !host_platform::kHasF16C) {
+      continue;
+    }
+    for (int op = 0; op < 4; op++) {
+      const bool is_max = (op % 2) == 0;
+      const uint64_t exp = is_max ? 0 : w.sign;
+      for (bool n_negative : {false, true}) {
+        static uint32_t code[1];
+        code[0] = kOps[op] | w.ftype;
+        SetV128(&state_, 1, n_negative ? w.sign : 0, 0);
+        SetV128(&state_, 2, n_negative ? 0 : w.sign, 0);
+        SetV128(&state_, 0, 0x1234, 0x5678);
+        GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+        bool ok = false;
+        RunRegion(&state_, code, end_pc, &ok);
+        ASSERT_TRUE(ok);
+        EXPECT_EQ(VLo64(&state_, 0), exp)
+            << std::hex << "insn 0x" << code[0] << " n_negative " << n_negative;
+        EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+      }
+    }
+  }
+}
+
+// FMAXV/FMINV/FMAXNMV/FMINNMV s0, v1.4s (and h0, v1.8h on F16C hosts) over
+// every sign pattern of zero lanes: the max forms return +0 unless every lane
+// is -0, the min forms -0 unless every lane is +0.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FpAcrossLanesMinMaxSignedZeros) {
+  // FMAXV, FMINV, FMAXNMV, FMINNMV with rd=0, rn=1; FP32 .4S then FP16 .8H.
+  constexpr uint32_t kOps[2][4] = {{0x6e30f820, 0x6eb0f820, 0x6e30c820, 0x6eb0c820},
+                                   {0x4e30f820, 0x4eb0f820, 0x4e30c820, 0x4eb0c820}};
+  for (int half = 0; half < 2; half++) {
+    if (half && !host_platform::kHasF16C) {
+      continue;
+    }
+    const int lanes = half ? 8 : 4;
+    const int bits = half ? 16 : 32;
+    const uint64_t sign = 1ull << (bits - 1);
+    for (int op = 0; op < 4; op++) {
+      const bool is_max = (op % 2) == 0;
+      for (uint32_t pattern = 0; pattern < (1u << lanes); pattern++) {
+        uint64_t lo = 0, hi = 0;
+        for (int i = 0; i < lanes; i++) {
+          if (pattern & (1u << i)) {
+            const int pos = i * bits;
+            (pos < 64 ? lo : hi) |= sign << (pos % 64);
+          }
+        }
+        const bool all_negative = pattern == (1u << lanes) - 1;
+        const bool any_negative = pattern != 0;
+        const uint64_t exp = (is_max ? all_negative : any_negative) ? sign : 0;
+        static uint32_t code[1];
+        code[0] = kOps[half][op];
+        SetV128(&state_, 1, lo, hi);
+        SetV128(&state_, 0, 0x1234, 0x5678);
+        GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+        bool ok = false;
+        RunRegion(&state_, code, end_pc, &ok);
+        ASSERT_TRUE(ok);
+        EXPECT_EQ(VLo64(&state_, 0), exp)
+            << std::hex << "insn 0x" << code[0] << " pattern 0x" << pattern;
+        EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+      }
+    }
+  }
 }
 
 // --- Vector FMAX/FMIN/FMAXNM/FMINNM (AdvSimdThreeSame) heavy mirror. ---
@@ -12156,6 +12482,36 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, BicVecImm) {
   const uint64_t imm = 0x0000AB000000AB00ULL;
   EXPECT_EQ(VLo64(&state_, 0), ~imm);
   EXPECT_EQ(VUpperHi64(&state_, 0), ~imm);
+}
+
+// dup v0.2d, x10; orr v0.2s, #0xab, lsl #8 (Q=0) — the D-form zeroes the upper
+// 64 bits of V0 even when the DUP's full 16-byte value reaches the ORR without
+// a round trip through memory.
+TEST_F(Arm64HeavyOptimizerFrontendTest, OrrVecImmDFormAfterFullWidthPutZeroesUpper) {
+  static const uint32_t code[] = {DupGen(/*q=*/true, /*imm5=*/0x08, 0, 10),
+                                  SimdModImm(/*q=*/false, /*op=*/0, /*cmode=*/0x3, 0xAB, 0)};
+  state_.cpu.x[10] = 0x1122334455667788ULL;
+  SetV128(&state_, 0, 0, 0);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), 0x1122334455667788ULL | 0x0000AB000000AB00ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
+}
+
+// dup v0.2d, x10; bic v0.2s, #0xab, lsl #8 (Q=0) — as above, for AND-NOT.
+TEST_F(Arm64HeavyOptimizerFrontendTest, BicVecImmDFormAfterFullWidthPutZeroesUpper) {
+  static const uint32_t code[] = {DupGen(/*q=*/true, /*imm5=*/0x08, 0, 10),
+                                  SimdModImm(/*q=*/false, /*op=*/1, /*cmode=*/0x3, 0xAB, 0)};
+  state_.cpu.x[10] = 0xFFFFFFFFFFFFFFFFULL;
+  SetV128(&state_, 0, 0, 0);
+  GuestAddr end_pc = ToGuestAddr(code) + sizeof(code);
+  bool ok = false;
+  RunRegion(&state_, code, end_pc, &ok);
+  ASSERT_TRUE(ok);
+  EXPECT_EQ(VLo64(&state_, 0), ~0x0000AB000000AB00ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0u);
 }
 
 // dup v8.2d, x10 — 64-bit broadcast (must use MOVQ, not MOVD).
@@ -17733,6 +18089,173 @@ TEST_F(Arm64HeavyOptimizerFrontendTest, Sha1Ops) {
   EXPECT_EQ(lane32(0, 1), 0u);
   EXPECT_EQ(lane32(0, 2), 0u);
   EXPECT_EQ(lane32(0, 3), 0u);
+}
+
+
+// ---- Hot lite-only forms lowered in the heavy tier: B/H SIMD&FP loads and
+// stores, FP32/FP64 vector FADDP, SQDMULH/SQRDMULH by element, and 16-bit-lane
+// SSHL/USHL. Each used to bail the whole region to lite. ----
+
+// ldur h2, [x1, #-4]: a 16-bit load zero-extends into all 128 bits of v2.
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdurHZeroesUpper) {
+  alignas(16) static const uint16_t buf[4] = {0xBEEF, 0x1234, 0x5678, 0x9ABC};
+  static const uint32_t code[] = {0x7c5fc022u};  // ldur h2, [x1, #-4]
+  std::memset(&state_.cpu.v[2], 0xAB, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[2]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(VLo64(&state_, 2), uint64_t{0xBEEF});
+  EXPECT_EQ(VUpperHi64(&state_, 2), 0ULL);
+}
+
+// ldr b0, [x1, #1]: an 8-bit load zero-extends (no sign extension of 0x80).
+TEST_F(Arm64HeavyOptimizerFrontendTest, LdrBZeroesUpper) {
+  alignas(16) static const uint8_t buf[4] = {0x11, 0x80, 0x22, 0x33};
+  static const uint32_t code[] = {0x3d400420u};  // ldr b0, [x1, #1]
+  std::memset(&state_.cpu.v[0], 0xAB, 16);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(VLo64(&state_, 0), uint64_t{0x80});
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0ULL);
+}
+
+// stur b7, [x12, #1]: writes exactly one byte.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SturBWritesOneByte) {
+  alignas(16) static uint8_t buf[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+  static const uint32_t code[] = {0x3c001187u};  // stur b7, [x12, #1]
+  SetV128(&state_, 7, 0x123456789ABCDEA5ULL, 0xFFFFFFFFFFFFFFFFULL);
+  state_.cpu.x[12] = ToGuestAddr(&buf[0]);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf[0], 0xFF);
+  EXPECT_EQ(buf[1], 0xA5);
+  EXPECT_EQ(buf[2], 0xFF);
+  EXPECT_EQ(buf[3], 0xFF);
+}
+
+// str h0, [x1, x2, lsl #1]: register offset scaled by 2; writes two bytes.
+TEST_F(Arm64HeavyOptimizerFrontendTest, StrHRegOffsetWritesTwoBytes) {
+  alignas(16) static uint16_t buf[4] = {0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF};
+  static const uint32_t code[] = {SimdLdStRegOffEnc(0b01, 0b00, 2, 0b011, 1, 1, 0)};
+  static_assert(SimdLdStRegOffEnc(0b01, 0b00, 2, 0b011, 1, 1, 0) == 0x7c227820u);
+  SetV128(&state_, 0, 0x2468ACE013571357ULL, 0x1111111111111111ULL);
+  state_.cpu.x[1] = ToGuestAddr(&buf[0]);
+  state_.cpu.x[2] = 2;
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(buf[0], 0xFFFF);
+  EXPECT_EQ(buf[1], 0xFFFF);
+  EXPECT_EQ(buf[2], 0x1357);
+  EXPECT_EQ(buf[3], 0xFFFF);
+}
+
+// faddp v0.4s, v1.4s, v2.4s: [n0+n1, n2+n3, m0+m1, m2+m3].
+TEST_F(Arm64HeavyOptimizerFrontendTest, FaddpVec4S) {
+  static const uint32_t code[] = {0x6e22d420u};
+  SetV128(&state_, 1, Pack2xF32(1.0f, 2.0f), Pack2xF32(3.5f, -0.5f));
+  SetV128(&state_, 2, Pack2xF32(10.0f, 20.0f), Pack2xF32(-1.0f, 1.0f));
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(VLo64(&state_, 0), Pack2xF32(3.0f, 3.0f));
+  EXPECT_EQ(VUpperHi64(&state_, 0), Pack2xF32(30.0f, 0.0f));
+}
+
+// faddp v0.2s, v1.2s, v2.2s: [n0+n1, m0+m1]; the upper halves of the sources
+// are ignored and Vd[127:64] is zeroed.
+TEST_F(Arm64HeavyOptimizerFrontendTest, FaddpVec2SUpperZero) {
+  static const uint32_t code[] = {0x2e22d420u};
+  SetV128(&state_, 1, Pack2xF32(1.0f, 2.0f), Pack2xF32(100.0f, 200.0f));
+  SetV128(&state_, 2, Pack2xF32(10.0f, 20.0f), Pack2xF32(300.0f, 400.0f));
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(VLo64(&state_, 0), Pack2xF32(3.0f, 30.0f));
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0ULL);
+}
+
+// faddp v0.2d, v1.2d, v2.2d: [n0+n1, m0+m1].
+TEST_F(Arm64HeavyOptimizerFrontendTest, FaddpVec2D) {
+  static const uint32_t code[] = {0x6e62d420u};
+  auto bits = [](double d) {
+    uint64_t b;
+    std::memcpy(&b, &d, sizeof(b));
+    return b;
+  };
+  SetV128(&state_, 1, bits(1.5), bits(2.25));
+  SetV128(&state_, 2, bits(-4.0), bits(0.5));
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(VLo64(&state_, 0), bits(3.75));
+  EXPECT_EQ(VUpperHi64(&state_, 0), bits(-3.5));
+}
+
+// sqrdmulh v0.8h, v1.8h, v2.h[7]: Vm lane 7 is INT16_MIN, so lane 0
+// (INT16_MIN * INT16_MIN) saturates to 0x7FFF; the others round to nearest.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqrdmulhIdx8HLane7) {
+  static const uint32_t code[] = {0x4f72d820u};
+  SetV128(&state_, 1, 0x7FFF000140008000ULL, 0xC00012340000FFFFULL);
+  SetV128(&state_, 2, 0x1111111111111111ULL, 0x8000111111111111ULL);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(VLo64(&state_, 0), 0x8001FFFFC0007FFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x4000EDCC00000001ULL);
+}
+
+// sqdmulh v0.4s, v1.4s, v2.s[3]: INT32_MIN * INT32_MIN saturates to 0x7FFFFFFF.
+TEST_F(Arm64HeavyOptimizerFrontendTest, SqdmulhIdx4SLane3) {
+  static const uint32_t code[] = {0x4fa2c820u};
+  SetV128(&state_, 1, 0x4000000080000000ULL, 0x7FFFFFFF00000001ULL);
+  SetV128(&state_, 2, 0x2222222222222222ULL, 0x8000000022222222ULL);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(VLo64(&state_, 0), 0xC00000007FFFFFFFULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x80000001FFFFFFFFULL);
+}
+
+// ushl/sshl .8h: per-halfword counts 1, -1, 16, -16, 127, 4 (high byte
+// garbage), -15, -128.
+constexpr uint64_t kShl16VnLo = 0x8001800180018001ULL;
+constexpr uint64_t kShl16VnHi = 0x800000011234FFFFULL;
+constexpr uint64_t kShl16VmLo = 0x00F0001000FF0001ULL;
+constexpr uint64_t kShl16VmHi = 0x008000F1FF04007FULL;
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, UshlVec8H) {
+  static const uint32_t code[] = {0x6e624420u};  // ushl v0.8h, v1.8h, v2.8h
+  SetV128(&state_, 1, kShl16VnLo, kShl16VnHi);
+  SetV128(&state_, 2, kShl16VmLo, kShl16VmHi);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000040000002ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0x0000000023400000ULL);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, SshlVec8H) {
+  static const uint32_t code[] = {0x4e624420u};  // sshl v0.8h, v1.8h, v2.8h
+  SetV128(&state_, 1, kShl16VnLo, kShl16VnHi);
+  SetV128(&state_, 2, kShl16VmLo, kShl16VmHi);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(VLo64(&state_, 0), 0xFFFF0000C0000002ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0xFFFF000023400000ULL);
+}
+
+TEST_F(Arm64HeavyOptimizerFrontendTest, UshlVec4HUpperZero) {
+  static const uint32_t code[] = {0x2e624420u};  // ushl v0.4h, v1.4h, v2.4h
+  SetV128(&state_, 1, kShl16VnLo, kShl16VnHi);
+  SetV128(&state_, 2, kShl16VmLo, kShl16VmHi);
+  SetV128(&state_, 0, 0xDEADBEEFCAFEF00DULL, 0x0123456789ABCDEFULL);
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  ASSERT_TRUE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
+  EXPECT_EQ(VLo64(&state_, 0), 0x0000000040000002ULL);
+  EXPECT_EQ(VUpperHi64(&state_, 0), 0ULL);
+}
+
+// 8-bit lanes still have no lowering and must bail.
+TEST_F(Arm64HeavyOptimizerFrontendTest, UshlVec16BBails) {
+  static const uint32_t code[] = {0x6e224420u};  // ushl v0.16b, v1.16b, v2.16b
+  state_.cpu.insn_addr = ToGuestAddr(code);
+  EXPECT_FALSE(RunOneInstruction(&state_, ToGuestAddr(code) + sizeof(code)));
 }
 
 }  // namespace berberis

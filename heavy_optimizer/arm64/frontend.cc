@@ -16,6 +16,8 @@
 
 #include "frontend.h"
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cinttypes>
 #include <cstddef>
@@ -25,6 +27,7 @@
 #include "berberis/assembler/x86_64.h"
 #include "berberis/backend/common/machine_ir.h"
 #include "berberis/backend/x86_64/machine_ir.h"
+#include "berberis/base/arena_set.h"
 #include "berberis/base/checks.h"
 #include "berberis/base/config.h"
 #include "berberis/base/config_globals.h"
@@ -123,6 +126,72 @@ const uint32_t* HeavyUnsignedEstimateTable(bool is_rsqrt) {
   static const uint32_t* const kRecpe = BuildHeavyUnsignedEstimateTable(false);
   static const uint32_t* const kRsqrte = BuildHeavyUnsignedEstimateTable(true);
   return is_rsqrt ? kRsqrte : kRecpe;
+}
+
+// PSHUFB masks for the interleaved LD2/LD3/LD4 and ST2/ST3/ST4. The guest
+// memory of one instruction, num_regs * (Q ? 16 : 8) bytes, is moved as
+// 16-byte chunks (the last one 8 bytes when the total is not a multiple of
+// 16). Memory byte `off` belongs to register (off / esize) % num_regs, at
+// register byte (off / esize / num_regs) * esize + off % esize.
+//   load:  mask (r, j) moves the bytes of chunk j that belong to register r
+//          to their register bytes; the OR over j is register r.
+//   store: mask (r, j) moves the bytes of register r that belong to chunk j
+//          to their chunk bytes; the OR over r is chunk j.
+// Every other mask byte is 0x80, which PSHUFB turns into zero, so a Q=0
+// register's upper half comes out zero.
+constexpr int kStructMaxChunks = 4;
+constexpr int kStructMaxRegs = 4;
+struct alignas(16) StructPermuteMask {
+  uint8_t bytes[16];
+  bool used;
+};
+using StructPermuteMasks = std::array<StructPermuteMask, kStructMaxRegs * kStructMaxChunks>;
+
+int StructTotalBytes(int num_regs, bool q) {
+  return num_regs * (q ? 16 : 8);
+}
+
+StructPermuteMasks BuildStructPermuteMasks(bool is_store, int num_regs, int size, bool q) {
+  StructPermuteMasks masks{};
+  for (auto& mask : masks) {
+    std::fill(std::begin(mask.bytes), std::end(mask.bytes), uint8_t{0x80});
+  }
+  const int esize = 1 << size;
+  for (int off = 0; off < StructTotalBytes(num_regs, q); off++) {
+    const int element = off / esize;
+    const int r = element % num_regs;
+    const int reg_byte = (element / num_regs) * esize + off % esize;
+    const int j = off / 16;
+    auto& mask = masks[r * kStructMaxChunks + j];
+    if (is_store) {
+      mask.bytes[off % 16] = static_cast<uint8_t>(reg_byte);
+    } else {
+      mask.bytes[reg_byte] = static_cast<uint8_t>(off % 16);
+    }
+    mask.used = true;
+  }
+  return masks;
+}
+
+// Indexed by [is_store][num_regs - 2][size][q]; built once and never freed,
+// since translated code reads the masks by address.
+const StructPermuteMasks& GetStructPermuteMasks(bool is_store, int num_regs, int size, bool q) {
+  using Table = std::array<StructPermuteMasks, 2 * 3 * 4 * 2>;
+  static const Table* const kTable = [] {
+    auto* table = new Table;
+    for (int st = 0; st < 2; st++) {
+      for (int n = 2; n <= 4; n++) {
+        for (int s = 0; s < 4; s++) {
+          for (int qq = 0; qq < 2; qq++) {
+            (*table)[((st * 3 + (n - 2)) * 4 + s) * 2 + qq] =
+                BuildStructPermuteMasks(st != 0, n, s, qq != 0);
+          }
+        }
+      }
+    }
+    return table;
+  }();
+  return (*kTable)[(((is_store ? 1 : 0) * 3 + (num_regs - 2)) * 4 + size) * 2 + (q ? 1 : 0)];
 }
 
 }  // namespace
@@ -303,17 +372,83 @@ Register HeavyOptimizerFrontend::EmitArmCondPredicate(Decoder::Condition cond) {
   return flags;
 }
 
-// Branch to then_bb when `cond` is met, else_bb otherwise. The predicate is a
-// 0/1 value; TestlRegReg sets ZF=1 when it is 0 (not taken) and ZF=0 when it is
-// 1 (taken), so the then_bb is selected on kNotZero.
+// Branch to then_bb when `cond` is met, else_bb otherwise. Rather than building
+// the 0/1 predicate EmitArmCondPredicate returns, test the NZCV word directly:
+// one TEST for a single-flag condition, AND+CMP for HI/LS, and for the
+// signed conditions fold N^V into bit 15 with (flags << 15) ^ flags, which
+// leaves Z at bit 14 untouched (the shifted-in bits are zero). The flags are
+// loaded with MovwRegOp for the same loop-optimizer reason as in
+// EmitArmCondPredicate; its upper bits are stale, but no mask used here reaches
+// above bit 15, so they need no clearing.
 void HeavyOptimizerFrontend::EmitCondBranch(Decoder::Condition cond,
                                             MachineBasicBlock* then_bb,
                                             MachineBasicBlock* else_bb) {
-  Register pred = EmitArmCondPredicate(cond);
-  builder_.Gen<PseudoCondBranch>(x86_64::Assembler::Condition::kNotZero,
-                                 then_bb,
-                                 else_bb,
-                                 std::get<0>(Gen<x86_64::TestlRegReg>(pred, pred)));
+  using HostCond = x86_64::Assembler::Condition;
+  const int32_t flags_disp = static_cast<int32_t>(offsetof(ThreadState, cpu.flags));
+  Register flags =
+      std::get<0>(Gen<x86_64::MovwRegOp>({.base = x86_64::kMachineRegRBP, .disp = flags_disp}));
+
+  auto test = [&](Register r, int32_t mask) -> Register {
+    return std::get<0>(Gen<x86_64::TestlRegImm>(r, mask));
+  };
+  // Bit 15 = N^V, bit 14 = Z.
+  auto fold_n_xor_v = [&]() -> Register {
+    Register r = std::get<0>(Gen<x86_64::MovlRegReg>(flags));
+    r = std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(r, int8_t{kFlagNegativeBit - kFlagOverflowBit}));
+    return std::get<0>(Gen<x86_64::XorlRegReg, kNoSSA>(r, flags));
+  };
+  constexpr int32_t kN = int32_t{1} << kFlagNegativeBit;
+  constexpr int32_t kZ = int32_t{1} << kFlagZeroBit;
+  constexpr int32_t kC = int32_t{1} << kFlagCarryBit;
+  constexpr int32_t kV = int32_t{1} << kFlagOverflowBit;
+
+  Register host_flags;
+  HostCond taken;
+  switch (cond) {
+    case Decoder::Condition::kEq:  // Z==1
+    case Decoder::Condition::kNe:  // Z==0
+      host_flags = test(flags, kZ);
+      taken = cond == Decoder::Condition::kEq ? HostCond::kNotZero : HostCond::kZero;
+      break;
+    case Decoder::Condition::kCs:  // C==1
+    case Decoder::Condition::kCc:  // C==0
+      host_flags = test(flags, kC);
+      taken = cond == Decoder::Condition::kCs ? HostCond::kNotZero : HostCond::kZero;
+      break;
+    case Decoder::Condition::kMi:  // N==1
+    case Decoder::Condition::kPl:  // N==0
+      host_flags = test(flags, kN);
+      taken = cond == Decoder::Condition::kMi ? HostCond::kNotZero : HostCond::kZero;
+      break;
+    case Decoder::Condition::kVs:  // V==1
+    case Decoder::Condition::kVc:  // V==0
+      host_flags = test(flags, kV);
+      taken = cond == Decoder::Condition::kVs ? HostCond::kNotZero : HostCond::kZero;
+      break;
+    case Decoder::Condition::kHi:    // C==1 && Z==0
+    case Decoder::Condition::kLs: {  // C==0 || Z==1
+      Register cz = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(flags, kC | kZ));
+      host_flags = std::get<0>(Gen<x86_64::CmplRegImm>(cz, kC));
+      taken = cond == Decoder::Condition::kHi ? HostCond::kEqual : HostCond::kNotEqual;
+      break;
+    }
+    case Decoder::Condition::kGe:  // N==V
+    case Decoder::Condition::kLt:  // N!=V
+      host_flags = test(fold_n_xor_v(), kN);
+      taken = cond == Decoder::Condition::kLt ? HostCond::kNotZero : HostCond::kZero;
+      break;
+    case Decoder::Condition::kGt:  // Z==0 && N==V
+    case Decoder::Condition::kLe:  // Z==1 || N!=V
+      host_flags = test(fold_n_xor_v(), kN | kZ);
+      taken = cond == Decoder::Condition::kLe ? HostCond::kNotZero : HostCond::kZero;
+      break;
+    case Decoder::Condition::kAl:
+    case Decoder::Condition::kNv:
+      // Unconditional: handled by the caller; never reached.
+      CHECK(false);
+      return;
+  }
+  builder_.Gen<PseudoCondBranch>(taken, then_bb, else_bb, host_flags);
 }
 
 // B.cond (conditional). AL/NV are unconditional. Otherwise split into a taken
@@ -339,15 +474,297 @@ void HeavyOptimizerFrontend::BranchCond(Decoder::Condition cond, int32_t offset)
   ir->AddEdge(cur_bb, then_bb);
   ir->AddEdge(cur_bb, else_bb);
 
-  EmitCondBranch(cond, then_bb, else_bb);
+  std::optional<NZCVStoreTail> tail = TakeNZCVStoreTail(cond);
+  if (tail) {
+    // StartInsn recorded this B.cond's position as the store just removed;
+    // point it at the PseudoReadFlags so the iterator stays valid. A jump to
+    // this B.cond never uses it: AddFusedCondBranchEntries gives it an entry.
+    branch_targets_[GetInsnAddr()] = builder_.GetMachineInsnPosition();
+    fused_cond_branches_.push_back({GetInsnAddr(), cond, *tail, then_bb, else_bb});
+    builder_.Gen<PseudoCondBranch>(tail->host_cond, then_bb, else_bb, tail->host_flags);
+  } else {
+    EmitCondBranch(cond, then_bb, else_bb);
+  }
 
   builder_.StartBasicBlock(then_bb);
+  if (tail) {
+    EmitNZCVStoreTail(*tail);
+  }
   GenJump(target);
 
   // Continue translating the not-taken path. A backward target is handled as an
   // in-region back-edge by GenJump+ResolveJumps (with the pending-signal
   // check), so do NOT set is_uncond_branch_/region-end here.
   builder_.StartBasicBlock(else_bb);
+  if (tail) {
+    EmitNZCVStoreTail(*tail);
+  }
+}
+
+// A B.cond right after a flag-setting instruction finds the current block
+// ending with that instruction's EmitMaterializeNZCV sequence:
+//   PseudoReadFlags raw, flags   (LAHF + SETO: reads the host flags only)
+//   AND raw, kFlagsNZCVMask
+//   XOR raw, kFlagCarry          (only for a subtraction)
+//   MOVW cpu.flags, raw
+// The host flags still hold the setter's result at the PseudoReadFlags, and
+// the packed NZCV is N = SF, Z = ZF, C = CF ^ is_sub, V = OF, so every ARM
+// condition is one x86 condition on them, except HI/LS when C = CF (x86 has no
+// single test for CF && !ZF). In that case the AND, XOR and store are removed
+// here, since they clobber the host flags, and the caller branches on the host
+// flags and re-emits them in both successors with EmitNZCVStoreTail. The
+// stored NZCV is the same on every path. A block that does not end with the
+// sequence (a setter in another block, or anything emitted after it) keeps
+// EmitCondBranch's read of cpu.flags, and so does a jump from elsewhere in the
+// region to the B.cond itself (AddFusedCondBranchEntries).
+std::optional<HeavyOptimizerFrontend::NZCVStoreTail> HeavyOptimizerFrontend::TakeNZCVStoreTail(
+    Decoder::Condition cond) {
+  using HostCond = x86_64::Assembler::Condition;
+  auto& insns = builder_.bb()->insn_list();
+  auto it = insns.end();
+  auto previous = [&]() -> const MachineInsn* {
+    if (it == insns.begin()) {
+      return nullptr;
+    }
+    return *--it;
+  };
+
+  // Walk back over the gap: instructions of the guest instructions between the
+  // setter and the B.cond that leave the host flags and cpu.flags alone.
+  std::array<const MachineInsn*, kMaxNZCVGapInsns + 1> tail_insns;
+  size_t num_tail_insns = 0;
+  const MachineInsn* store = previous();
+  while (store != nullptr && !IsNZCVStore(store)) {
+    if (num_tail_insns == kMaxNZCVGapInsns || !IsNZCVGapInsn(store)) {
+      return std::nullopt;
+    }
+    tail_insns[num_tail_insns++] = store;
+    store = previous();
+  }
+  if (store == nullptr) {
+    return std::nullopt;
+  }
+  tail_insns[num_tail_insns++] = store;
+  auto store_it = it;
+  Register raw = store->RegAt(1);
+
+  const MachineInsn* insn = previous();
+  bool is_sub = false;
+  if (insn != nullptr && insn->opcode() == kMachineOpXorlRegImm) {
+    if (insn->RegAt(0) != raw || x86_64::AsMachineInsnX86_64(insn)->imm() != CPUState::kFlagCarry) {
+      return std::nullopt;
+    }
+    is_sub = true;
+    insn = previous();
+  }
+  if (insn == nullptr || insn->opcode() != kMachineOpAndlRegImm || insn->RegAt(0) != raw ||
+      x86_64::AsMachineInsnX86_64(insn)->imm() != kFlagsNZCVMask) {
+    return std::nullopt;
+  }
+  auto and_it = it;
+
+  const MachineInsn* read = previous();
+  if (read == nullptr || read->opcode() != kMachineOpPseudoReadFlags ||
+      read->RegAt(0) != raw || !static_cast<const PseudoReadFlags*>(read)->with_overflow()) {
+    return std::nullopt;
+  }
+
+  HostCond host_cond;
+  switch (cond) {
+    case Decoder::Condition::kEq:
+      host_cond = HostCond::kZero;
+      break;
+    case Decoder::Condition::kNe:
+      host_cond = HostCond::kNotZero;
+      break;
+    case Decoder::Condition::kCs:
+      host_cond = is_sub ? HostCond::kNotCarry : HostCond::kCarry;
+      break;
+    case Decoder::Condition::kCc:
+      host_cond = is_sub ? HostCond::kCarry : HostCond::kNotCarry;
+      break;
+    case Decoder::Condition::kMi:
+      host_cond = HostCond::kSign;
+      break;
+    case Decoder::Condition::kPl:
+      host_cond = HostCond::kNotSign;
+      break;
+    case Decoder::Condition::kVs:
+      host_cond = HostCond::kOverflow;
+      break;
+    case Decoder::Condition::kVc:
+      host_cond = HostCond::kNoOverflow;
+      break;
+    case Decoder::Condition::kHi:  // C==1 && Z==0: CF==0 && ZF==0 after a subtraction.
+      if (!is_sub) {
+        return std::nullopt;
+      }
+      host_cond = HostCond::kAbove;
+      break;
+    case Decoder::Condition::kLs:  // C==0 || Z==1: CF==1 || ZF==1 after a subtraction.
+      if (!is_sub) {
+        return std::nullopt;
+      }
+      host_cond = HostCond::kBelowEqual;
+      break;
+    case Decoder::Condition::kGe:
+      host_cond = HostCond::kGreaterEqual;
+      break;
+    case Decoder::Condition::kLt:
+      host_cond = HostCond::kLess;
+      break;
+    case Decoder::Condition::kGt:
+      host_cond = HostCond::kGreater;
+      break;
+    case Decoder::Condition::kLe:
+      host_cond = HostCond::kLessEqual;
+      break;
+    case Decoder::Condition::kAl:
+    case Decoder::Condition::kNv:
+      return std::nullopt;
+  }
+
+  auto read_it = std::prev(and_it);
+  // The guest instructions of the gap start right after the store or a gap
+  // instruction. Point the ones at the store (to be erased) at the
+  // PseudoReadFlags, and find where the gap starts: a jump into it cannot
+  // reach the B.cond's host flags (AddFusedCondBranchEntries).
+  GuestAddr gap_begin = GetInsnAddr();
+  auto in_tail = [&](const MachineInsnPosition& pos) {
+    if (pos.first != builder_.bb() || !pos.second.has_value()) {
+      return false;
+    }
+    const MachineInsn* insn = *pos.second.value();
+    return std::find(tail_insns.begin(), tail_insns.begin() + num_tail_insns, insn) !=
+           tail_insns.begin() + num_tail_insns;
+  };
+  for (auto target_it = branch_targets_.lower_bound(GetInsnAddr());
+       target_it != branch_targets_.begin();) {
+    --target_it;
+    if (!in_tail(target_it->second)) {
+      break;
+    }
+    if (target_it->second.second.value() == store_it) {
+      target_it->second.second = read_it;
+    }
+    gap_begin = target_it->first;
+  }
+
+  Register host_flags = read->RegAt(1);
+  insns.erase(and_it, std::next(store_it));
+  return NZCVStoreTail{raw, host_flags, is_sub, host_cond, gap_begin};
+}
+
+bool HeavyOptimizerFrontend::IsNZCVStore(const MachineInsn* insn) {
+  return insn->opcode() == kMachineOpMovwMemBaseDispReg &&
+         insn->RegAt(0) == x86_64::kMachineRegRBP &&
+         x86_64::AsMachineInsnX86_64(insn)->disp() == offsetof(ThreadState, cpu.flags);
+}
+
+// A gap instruction must keep the host flags (no FLAGS operand: no flag setter,
+// flag reader or call), must not fault (a fault would see the stale cpu.flags
+// the erased store leaves until a successor writes it), and must not access
+// cpu.flags through the ThreadState.
+bool HeavyOptimizerFrontend::IsNZCVGapInsn(const MachineInsn* insn) {
+  if (insn->recovery_bb() != nullptr || insn->recovery_pc() != 0 ||
+      insn->opcode() == kMachineOpCallImm || insn->opcode() == kMachineOpCallImmArg ||
+      insn->opcode() == kMachineOpPseudoJump || insn->opcode() == kMachineOpPseudoBranch ||
+      insn->opcode() == kMachineOpPseudoCondBranch ||
+      insn->opcode() == kMachineOpPseudoIndirectJump) {
+    return false;
+  }
+  bool uses_thread_state = false;
+  for (int i = 0; i < insn->NumRegOperands(); i++) {
+    if (insn->RegAt(i) == x86_64::kMachineRegFLAGS ||
+        insn->RegKindAt(i).RegClass()->IsSubsetOf(&x86_64::kFLAGS)) {
+      return false;
+    }
+    uses_thread_state |= insn->RegAt(i) == x86_64::kMachineRegRBP;
+  }
+  if (!uses_thread_state) {
+    return true;
+  }
+  // Any access of up to 32 bytes that could overlap the 16-bit cpu.flags.
+  const int64_t flags_disp = offsetof(ThreadState, cpu.flags);
+  auto overlaps = [&](uint32_t disp) {
+    int64_t offset = static_cast<int32_t>(disp);
+    return offset > flags_disp - 32 && offset < flags_disp + 2;
+  };
+  const auto* x86_insn = x86_64::AsMachineInsnX86_64(insn);
+  return !overlaps(x86_insn->disp()) && !overlaps(x86_insn->disp2());
+}
+
+void HeavyOptimizerFrontend::EmitNZCVStoreTail(const NZCVStoreTail& tail) {
+  Register raw = tail.raw;
+  raw = std::get<0>(Gen<x86_64::AndlRegImm, kNoSSA>(raw, static_cast<int32_t>(kFlagsNZCVMask)));
+  if (tail.is_sub) {
+    raw = std::get<0>(Gen<x86_64::XorlRegImm, kNoSSA>(raw, static_cast<int32_t>(CPUState::kFlagCarry)));
+  }
+  builder_.Gen<x86_64::MovwOpReg>(
+      {.base = x86_64::kMachineRegRBP,
+       .disp = static_cast<int32_t>(offsetof(ThreadState, cpu.flags))},
+      raw);
+}
+
+// An in-region jump to a fused B.cond arrives without the setter's host flags
+// or `raw`, so it cannot enter the setter's block at the PseudoCondBranch.
+// Give it an entry block that loads `raw` from cpu.flags (pre-inverting C for a
+// subtraction, so the successors' AND/XOR/store write back the same NZCV) and
+// branches on the stored NZCV like an unfused B.cond, into the same
+// successors. The B.cond's branch target then starts that block. Runs in
+// Finalize before ResolveJumps, which is the only user of the target positions.
+void HeavyOptimizerFrontend::AddFusedCondBranchEntries() {
+  if (fused_cond_branches_.empty()) {
+    return;
+  }
+  auto* ir = builder_.ir();
+  ArenaSet<GuestAddr> jump_targets(ir->arena());
+  for (auto* bb : ir->bb_list()) {
+    if (bb->is_recovery() || bb->insn_list().empty()) {
+      continue;
+    }
+    const MachineInsn* last_insn = bb->insn_list().back();
+    if (last_insn->opcode() != kMachineOpPseudoJump) {
+      continue;
+    }
+    auto* jump = static_cast<const PseudoJump*>(last_insn);
+    if (jump->kind() == PseudoJump::Kind::kSyscall ||
+        jump->kind() == PseudoJump::Kind::kExitGeneratedCode) {
+      continue;
+    }
+    jump_targets.insert(jump->target());
+  }
+
+  const int32_t flags_disp = static_cast<int32_t>(offsetof(ThreadState, cpu.flags));
+  for (const auto& fused : fused_cond_branches_) {
+    if (jump_targets.find(fused.addr) == jump_targets.end()) {
+      continue;
+    }
+    auto* entry_bb = ir->NewBasicBlock();
+    builder_.StartBasicBlock(entry_bb);
+    builder_.Gen<x86_64::MovwRegOp>(fused.tail.raw,
+                                    {.base = x86_64::kMachineRegRBP, .disp = flags_disp});
+    if (fused.tail.is_sub) {
+      Gen<x86_64::XorlRegImm, kNoSSA>(fused.tail.raw, static_cast<int32_t>(CPUState::kFlagCarry));
+    }
+    EmitCondBranch(fused.cond, fused.then_bb, fused.else_bb);
+    ir->AddEdge(entry_bb, fused.then_bb);
+    ir->AddEdge(entry_bb, fused.else_bb);
+    branch_targets_[fused.addr] = MachineInsnPosition{entry_bb, std::nullopt};
+  }
+
+  // A jump into a gap would run the rest of the gap and reach the
+  // PseudoCondBranch without the setter's host flags. Leave it a region exit:
+  // the gap's guest code is translated again from that address.
+  for (const auto& fused : fused_cond_branches_) {
+    for (auto target_it = branch_targets_.lower_bound(fused.tail.gap_begin);
+         target_it != branch_targets_.end() && target_it->first < fused.addr;
+         ++target_it) {
+      if (jump_targets.find(target_it->first) != jump_targets.end()) {
+        target_it->second = MachineInsnPosition{};
+      }
+    }
+  }
 }
 
 // CBZ (is_nonzero=false) / CBNZ (is_nonzero=true). Test the source for zero and
@@ -2404,6 +2821,8 @@ void HeavyOptimizerFrontend::Finalize(GuestAddr stop_pc) {
     GenJump(stop_pc);
   }
 
+  AddFusedCondBranchEntries();
+
   // This loop advances the iterators in branch_targets by one. Because in
   // StartInsn(), we saved the iterator to the last insn before we generate the
   // first insn for each guest address. If an insn is saved as an empty optional,
@@ -2527,7 +2946,7 @@ Register HeavyOptimizerFrontend::LogicalImm(Decoder::LogicalImmOpcode opcode, bo
     }
   }
   // 32-bit op: the l-suffix form zero-extends the result to 64 bits.
-  Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
+  Register res = CopyForWrite32(src);
   switch (opcode) {
     case Decoder::LogicalImmOpcode::kAnd:
       return std::get<0>(Gen<x86_64::AndlRegReg, kNoSSA>(res, imm_reg));
@@ -2642,7 +3061,7 @@ Register HeavyOptimizerFrontend::Bitfield(Decoder::BitfieldOpcode opcode,
         Register res = Copy(src);
         return std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(res, static_cast<int8_t>(shift)));
       }
-      Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src));
+      Register res = CopyForWrite32(src);
       return std::get<0>(Gen<x86_64::ShllRegImm, kNoSSA>(res, static_cast<int8_t>(shift)));
     }
     // UXTB: UBFM Wd, Wn, #0, #7.
@@ -3161,7 +3580,7 @@ Register HeavyOptimizerFrontend::LogicalShiftedReg(Decoder::LogicalShiftedRegOpc
         return AllocTempReg();
     }
   }
-  Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src1));
+  Register res = CopyForWrite32(src1);
   switch (opcode) {
     case Decoder::LogicalShiftedRegOpcode::kAnd:
       return std::get<0>(Gen<x86_64::AndlRegReg, kNoSSA>(res, op2));
@@ -3214,7 +3633,7 @@ Register HeavyOptimizerFrontend::AddSubShiftedReg(bool is_sub,
     }
     return r;
   }
-  Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src1));
+  Register res = CopyForWrite32(src1);
   if (is_sub) {
     auto [r, flags] = Gen<x86_64::SublRegReg, kNoSSA>(res, op2);
     if (set_flags) {
@@ -3315,7 +3734,7 @@ Register HeavyOptimizerFrontend::AddSubExtendedReg(bool is_sub,
     }
     return r;
   }
-  Register res = std::get<0>(Gen<x86_64::MovlRegReg>(src1));
+  Register res = CopyForWrite32(src1);
   if (is_sub) {
     auto [r, flags] = Gen<x86_64::SublRegReg, kNoSSA>(res, ext);
     if (set_flags) {
@@ -4630,46 +5049,16 @@ void HeavyOptimizerFrontend::FpDataProc2(const Decoder::FpDataProc2Args& args) {
       case 0b0011:    // FSUB
         builder_.Gen<x86_64::SubssXRegXReg>(n.machine_reg(), m.machine_reg());
         break;
-      case 0b0100:      // FMAX (NaN-propagating: MAXPS|MAXPS|POR)
-      case 0b0101: {    // FMIN
-        FpRegister tmp = AllocTempSimdReg();
-        builder_.Gen<x86_64::MovdqaXRegXReg>(tmp.machine_reg(), m.machine_reg());
-        if (args.opcode == 0b0100) {
-          builder_.Gen<x86_64::MaxpsXRegXReg>(tmp.machine_reg(), n.machine_reg());
-          builder_.Gen<x86_64::MaxpsXRegXReg>(n.machine_reg(), m.machine_reg());
-        } else {
-          builder_.Gen<x86_64::MinpsXRegXReg>(tmp.machine_reg(), n.machine_reg());
-          builder_.Gen<x86_64::MinpsXRegXReg>(n.machine_reg(), m.machine_reg());
-        }
-        builder_.Gen<x86_64::PorXRegXReg>(n.machine_reg(), tmp.machine_reg());
+      case 0b0100:    // FMAX
+      case 0b0101:    // FMIN
+      case 0b0110:    // FMAXNM
+      case 0b0111:    // FMINNM
+        result = EmitArmFpMinMax(n,
+                                 m,
+                                 /*is_max=*/args.opcode == 0b0100 || args.opcode == 0b0110,
+                                 /*is_nm=*/args.opcode >= 0b0110,
+                                 /*is_double=*/false);
         break;
-      }
-      case 0b0110:      // FMAXNM (NaN-suppressing: substitute NaN lane, then MAX/MIN)
-      case 0b0111: {    // FMINNM
-        FpRegister mask_a = AllocTempSimdReg();
-        FpRegister mask_b = AllocTempSimdReg();
-        FpRegister an_sub = AllocTempSimdReg();
-        FpRegister bn_sub = AllocTempSimdReg();
-        builder_.Gen<x86_64::MovdqaXRegXReg>(mask_a.machine_reg(), n.machine_reg());
-        builder_.Gen<x86_64::CmpunordpsXRegXReg>(mask_a.machine_reg(), mask_a.machine_reg());
-        builder_.Gen<x86_64::MovdqaXRegXReg>(mask_b.machine_reg(), m.machine_reg());
-        builder_.Gen<x86_64::CmpunordpsXRegXReg>(mask_b.machine_reg(), mask_b.machine_reg());
-        builder_.Gen<x86_64::MovdqaXRegXReg>(an_sub.machine_reg(), mask_a.machine_reg());
-        builder_.Gen<x86_64::PandXRegXReg>(an_sub.machine_reg(), m.machine_reg());
-        builder_.Gen<x86_64::MovdqaXRegXReg>(bn_sub.machine_reg(), mask_b.machine_reg());
-        builder_.Gen<x86_64::PandXRegXReg>(bn_sub.machine_reg(), n.machine_reg());
-        builder_.Gen<x86_64::PandnXRegXReg>(mask_a.machine_reg(), n.machine_reg());
-        builder_.Gen<x86_64::PandnXRegXReg>(mask_b.machine_reg(), m.machine_reg());
-        builder_.Gen<x86_64::PorXRegXReg>(mask_a.machine_reg(), an_sub.machine_reg());
-        builder_.Gen<x86_64::PorXRegXReg>(mask_b.machine_reg(), bn_sub.machine_reg());
-        if (args.opcode == 0b0110) {
-          builder_.Gen<x86_64::MaxpsXRegXReg>(mask_a.machine_reg(), mask_b.machine_reg());
-        } else {
-          builder_.Gen<x86_64::MinpsXRegXReg>(mask_a.machine_reg(), mask_b.machine_reg());
-        }
-        result = mask_a;
-        break;
-      }
     }
     if (args.opcode == 0b1000) {
       // FNMUL: flip lane-0 FP32 sign; lanes 1..3 (=+0.0) XOR 0 stay +0.0.
@@ -4689,85 +5078,13 @@ void HeavyOptimizerFrontend::FpDataProc2(const Decoder::FpDataProc2Args& args) {
   FpRegister src1 = GetVRegScalar(args.rn, is_double);
   FpRegister src2 = GetVRegScalar(args.rm, is_double);
 
-  // FMAX/FMIN/FMAXNM/FMINNM (0b0100..0b0111). x86 MAXP{S,D}/MINP{S,D} have
-  // ARM-incompatible NaN and signed-zero semantics, so mirror the lite tier's
-  // explicit sequences. Packed ops run on the scalar-loaded registers; only
-  // lane 0 is written back by SetVRegScalar, so upper-lane garbage is
-  // irrelevant. NaN-propagating FMAX/FMIN (ARM: any NaN in -> NaN out) use the
-  // symmetric MAX|MAX|POR idiom (the POR keeps a NaN exponent if either input
-  // was NaN, and the two-sided MAX makes +-0 order-independent). NaN-
-  // suppressing FMAXNM/FMINNM (ARM: exactly one NaN -> the number) substitute
-  // each NaN lane with the other operand — via a CMPUNORDP{S,D} self-compare
-  // mask — before the MAX/MIN. Mirrors lite_translator.h's scalar path.
+  // FMAX/FMIN/FMAXNM/FMINNM (0b0100..0b0111) run the packed sequence of
+  // EmitArmFpMinMax on the scalar-loaded registers; only lane 0 is written
+  // back by SetVRegScalar, so the upper lanes are irrelevant.
   if (args.opcode >= 0b0100 && args.opcode <= 0b0111) {
     const bool is_max = (args.opcode == 0b0100 || args.opcode == 0b0110);
     const bool is_nm = (args.opcode == 0b0110 || args.opcode == 0b0111);
-    FpRegister n = src1;
-    FpRegister m = src2;
-    if (!is_nm) {
-      // NaN-propagating: tmp = m; MAXP tmp,n; MAXP n,m; POR n,tmp.
-      FpRegister tmp = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(tmp.machine_reg(), m.machine_reg());
-      if (is_max) {
-        if (is_double) {
-          builder_.Gen<x86_64::MaxpdXRegXReg>(tmp.machine_reg(), n.machine_reg());
-          builder_.Gen<x86_64::MaxpdXRegXReg>(n.machine_reg(), m.machine_reg());
-        } else {
-          builder_.Gen<x86_64::MaxpsXRegXReg>(tmp.machine_reg(), n.machine_reg());
-          builder_.Gen<x86_64::MaxpsXRegXReg>(n.machine_reg(), m.machine_reg());
-        }
-      } else {
-        if (is_double) {
-          builder_.Gen<x86_64::MinpdXRegXReg>(tmp.machine_reg(), n.machine_reg());
-          builder_.Gen<x86_64::MinpdXRegXReg>(n.machine_reg(), m.machine_reg());
-        } else {
-          builder_.Gen<x86_64::MinpsXRegXReg>(tmp.machine_reg(), n.machine_reg());
-          builder_.Gen<x86_64::MinpsXRegXReg>(n.machine_reg(), m.machine_reg());
-        }
-      }
-      builder_.Gen<x86_64::PorXRegXReg>(n.machine_reg(), tmp.machine_reg());
-      SetVRegScalar(args.rd, n, is_double);
-    } else {
-      // NaN-suppressing: mask_a=isnan(n), mask_b=isnan(m). Substitute the NaN
-      // lanes with the other operand (an_sub = isnan(n) ? m; bn_sub =
-      // isnan(m) ? n), giving sub_n = select(isnan(n), m, n) and sub_m =
-      // select(isnan(m), n, m); then MAX/MIN the substituted pair.
-      FpRegister mask_a = AllocTempSimdReg();
-      FpRegister mask_b = AllocTempSimdReg();
-      FpRegister an_sub = AllocTempSimdReg();
-      FpRegister bn_sub = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(mask_a.machine_reg(), n.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(mask_b.machine_reg(), m.machine_reg());
-      if (is_double) {
-        builder_.Gen<x86_64::CmpunordpdXRegXReg>(mask_a.machine_reg(), mask_a.machine_reg());
-        builder_.Gen<x86_64::CmpunordpdXRegXReg>(mask_b.machine_reg(), mask_b.machine_reg());
-      } else {
-        builder_.Gen<x86_64::CmpunordpsXRegXReg>(mask_a.machine_reg(), mask_a.machine_reg());
-        builder_.Gen<x86_64::CmpunordpsXRegXReg>(mask_b.machine_reg(), mask_b.machine_reg());
-      }
-      builder_.Gen<x86_64::MovdqaXRegXReg>(an_sub.machine_reg(), mask_a.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(an_sub.machine_reg(), m.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(bn_sub.machine_reg(), mask_b.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(bn_sub.machine_reg(), n.machine_reg());
-      builder_.Gen<x86_64::PandnXRegXReg>(mask_a.machine_reg(), n.machine_reg());
-      builder_.Gen<x86_64::PandnXRegXReg>(mask_b.machine_reg(), m.machine_reg());
-      builder_.Gen<x86_64::PorXRegXReg>(mask_a.machine_reg(), an_sub.machine_reg());
-      builder_.Gen<x86_64::PorXRegXReg>(mask_b.machine_reg(), bn_sub.machine_reg());
-      if (is_max) {
-        if (is_double) {
-          builder_.Gen<x86_64::MaxpdXRegXReg>(mask_a.machine_reg(), mask_b.machine_reg());
-        } else {
-          builder_.Gen<x86_64::MaxpsXRegXReg>(mask_a.machine_reg(), mask_b.machine_reg());
-        }
-      } else {
-        if (is_double) {
-          builder_.Gen<x86_64::MinpdXRegXReg>(mask_a.machine_reg(), mask_b.machine_reg());
-        } else {
-          builder_.Gen<x86_64::MinpsXRegXReg>(mask_a.machine_reg(), mask_b.machine_reg());
-        }
-      }
-      SetVRegScalar(args.rd, mask_a, is_double);
-    }
+    SetVRegScalar(args.rd, EmitArmFpMinMax(src1, src2, is_max, is_nm, is_double), is_double);
     return;
   }
 
@@ -5422,26 +5739,20 @@ void HeavyOptimizerFrontend::SimdModifiedImm(const Decoder::SimdModifiedImmArgs&
     return;
   }
 
-  // ORR/BIC: load current V[rd] (D-form must zero-extend the low 64 so the
-  // upper half ends up zeroed), then OR (set) / AND-NOT (clear) the immediate.
+  // ORR/BIC: load the full current V[rd], then OR (set) / AND-NOT (clear) the
+  // immediate. The D-form zeroes the upper 64 bits in SetVRegFull: a guest
+  // context get may be forwarded from an earlier full-width put, so the load
+  // itself does not zero them.
   FpRegister xd = AllocTempSimdReg();
-  if (args.q) {
-    builder_.GenGetSimd<16>(xd.machine_reg(), off);
-  } else {
-    // MOVSD reg<-mem zero-extends the upper 64 bits of the XMM. The MOVSD load
-    // is one of the SIMD opcodes RemoveLocalGuestContextAccesses recognizes as
-    // a guest-context GET, so a prior 16-byte store forwards correctly.
-    xd = FpRegister{std::get<0>(Gen<x86_64::MovsdXRegOp>(
-        {.base = x86_64::kMachineRegRBP, .disp = off}))};
-  }
+  builder_.GenGetSimd<16>(xd.machine_reg(), off);
   if (args.op == 0) {
     builder_.Gen<x86_64::PorXRegXReg>(xd.machine_reg(), ximm.machine_reg());
-    builder_.GenSetSimd<16>(off, xd.machine_reg());
+    SetVRegFull(args.rd, xd, args.q);
   } else {
     // BIC: xd = ~imm & Vd. PANDN(dst, src) computes dst = ~dst & src, so with
     // dst=ximm, src=xd we get ~imm & Vd; the result lands in ximm.
     builder_.Gen<x86_64::PandnXRegXReg>(ximm.machine_reg(), xd.machine_reg());
-    builder_.GenSetSimd<16>(off, ximm.machine_reg());
+    SetVRegFull(args.rd, ximm, args.q);
   }
 }
 
@@ -5450,26 +5761,53 @@ void HeavyOptimizerFrontend::SimdLoadLiteral(const Decoder::SimdLoadLiteralArgs&
   UNUSED_ARGS(args);
 }
 
+void HeavyOptimizerFrontend::EmitSimdLoadStoreNarrow(bool is_store,
+                                                     Decoder::SimdLoadStoreSize size,
+                                                     Register masked,
+                                                     int32_t disp,
+                                                     int32_t vreg_off) {
+  const bool is_byte = (size == Decoder::SimdLoadStoreSize::k8bit);
+  if (is_store) {
+    FpRegister xmm = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(xmm.machine_reg(), vreg_off);
+    Register data = std::get<0>(Gen<x86_64::MovdRegXReg>(xmm.machine_reg()));
+    if (is_byte) {
+      Gen<x86_64::MovbOpReg>({.base = masked, .disp = disp}, data);
+    } else {
+      Gen<x86_64::MovwOpReg>({.base = masked, .disp = disp}, data);
+    }
+    GenRecoveryBlockForLastInsn();
+    return;
+  }
+  Register data = is_byte
+                      ? std::get<0>(Gen<x86_64::MovzxblRegOp>({.base = masked, .disp = disp}))
+                      : std::get<0>(Gen<x86_64::MovzxwlRegOp>({.base = masked, .disp = disp}));
+  GenRecoveryBlockForLastInsn();
+  FpRegister xmm = AllocTempSimdReg();
+  builder_.Gen<x86_64::MovdXRegReg>(xmm.machine_reg(), data);
+  builder_.GenSetSimd<16>(vreg_off, xmm.machine_reg());
+}
+
 // LDR/STR (SIMD&FP, immediate): 128/64/32-bit (Q/D/S). A load zero-extends the
 // rest of the 128-bit V[rt] (MOVSD/MOVSS already clear the unused lanes; the
 // full 16-byte slot is then committed). The memory access uses the unaligned
 // MOVDQU/MOVSD/MOVSS forms (guest memory is not 16-byte aligned) and a recovery
 // block so a host fault is delivered to the guest signal handler. The V[rt]
 // slot is 16-byte aligned, so its access uses GenGetSimd/GenSetSimd (MOVDQA).
-// 8/16-bit (B/H) bail to the lite tier. Mirrors lite_translator.h::SimdLoadStoreImm.
+// 8/16-bit (B/H) go through a GP register (EmitSimdLoadStoreNarrow). Mirrors
+// lite_translator.h::SimdLoadStoreImm.
 void HeavyOptimizerFrontend::SimdLoadStoreImm(const Decoder::SimdLoadStoreImmArgs& args, Register base) {
   if (!success()) {
-    return;
-  }
-  if (args.size != Decoder::SimdLoadStoreSize::k32bit &&
-      args.size != Decoder::SimdLoadStoreSize::k64bit &&
-      args.size != Decoder::SimdLoadStoreSize::k128bit) {
-    UndefinedReturningVoid(BailReason::kUnsupportedSize);
     return;
   }
   Register masked = ApplyTbi(base);
   const int32_t off = static_cast<int32_t>(args.offset);
   const int32_t vreg_off = GetVRegOffset(args.rt);
+  if (args.size == Decoder::SimdLoadStoreSize::k8bit ||
+      args.size == Decoder::SimdLoadStoreSize::k16bit) {
+    EmitSimdLoadStoreNarrow(args.is_store, args.size, masked, off, vreg_off);
+    return;
+  }
   FpRegister xmm = AllocTempSimdReg();
   if (args.is_store) {
     builder_.GenGetSimd<16>(xmm.machine_reg(), vreg_off);
@@ -5593,21 +5931,20 @@ void HeavyOptimizerFrontend::SimdLoadStorePair(const Decoder::SimdLoadStorePairA
 // then reuse SimdLoadStoreImm's mem<->xmm<->v[] path at disp=0. A load's
 // MOVSD/MOVSS zero-extends the unused lanes and the full 16-byte v[] slot is
 // committed; the memory access uses the unaligned MOVDQU/MOVSD/MOVSS forms and
-// a recovery block. 8/16-bit (B/H) bail to the lite tier (which covers all
-// sizes), matching SimdLoadStoreImm. Mirrors lite_translator.h::SimdLoadStoreReg.
+// a recovery block. 8/16-bit (B/H) go through a GP register, as in
+// SimdLoadStoreImm. Mirrors lite_translator.h::SimdLoadStoreReg.
 void HeavyOptimizerFrontend::SimdLoadStoreReg(const Decoder::SimdLoadStoreRegArgs& args, Register base, Register offset) {
   if (!success()) {
-    return;
-  }
-  if (args.size != Decoder::SimdLoadStoreSize::k32bit &&
-      args.size != Decoder::SimdLoadStoreSize::k64bit &&
-      args.size != Decoder::SimdLoadStoreSize::k128bit) {
-    UndefinedReturningVoid(BailReason::kUnsupportedSize);
     return;
   }
   Register addr = EmitRegOffsetAddr(base, offset, args.extend_type, args.shift_amount);
   Register masked = ApplyTbi(addr);
   const int32_t vreg_off = GetVRegOffset(args.rt);
+  if (args.size == Decoder::SimdLoadStoreSize::k8bit ||
+      args.size == Decoder::SimdLoadStoreSize::k16bit) {
+    EmitSimdLoadStoreNarrow(args.is_store, args.size, masked, 0, vreg_off);
+    return;
+  }
   FpRegister xmm = AllocTempSimdReg();
   if (args.is_store) {
     builder_.GenGetSimd<16>(xmm.machine_reg(), vreg_off);
@@ -6060,6 +6397,195 @@ void HeavyOptimizerFrontend::AdvSimdCopy(const Decoder::AdvSimdCopyArgs& args) {
   SetVRegFull(args.rd, xmm, args.q);
 }
 
+// Vector SQDMULH / SQRDMULH on loaded operands: per lane (2*xn*xm) >> esize,
+// plus 2^(esize-1) before the shift when is_round, with the INT_MIN*INT_MIN
+// corner saturated to INT_MAX. size is 01 (16-bit lanes) or 10 (32-bit
+// lanes); the caller has checked SqdmulhVecSupported. Shared by the
+// three-same form and the by-element form (after broadcasting the lane).
+// Returns the result register; xn is clobbered.
+bool HeavyOptimizerFrontend::SqdmulhVecSupported(uint8_t size, bool is_round) {
+  if (size == 0b01) {
+    return !is_round || host_platform::kHasSSSE3;
+  }
+  return size == 0b10 && host_platform::kHasSSE4_1;
+}
+
+HeavyOptimizerFrontend::FpRegister HeavyOptimizerFrontend::EmitSqdmulhVec(FpRegister xn,
+                                                                          FpRegister xm,
+                                                                          uint8_t size,
+                                                                          bool is_round) {
+  if (size == 0b01) {
+    if (is_round) {
+      // SQRDMULH .4H/.8H via PMULHRSW + corner fixup (SSSE3). PMULHRSW
+      // computes ((a*b >> 14) + 1) >> 1 = round((2*a*b)/2^16) already, so
+      // only the INT16_MIN*INT16_MIN corner needs the ^0xFFFF flip.
+      FpRegister xn_corner = AllocTempSimdReg();
+      FpRegister xm_corner = AllocTempSimdReg();
+      FpRegister x_min = AllocZeroedSimdReg();  // pre-defined: self-Pcmpeqw idiom
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xn_corner.machine_reg(), xn.machine_reg());
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xm_corner.machine_reg(), xm.machine_reg());
+      builder_.Gen<x86_64::PcmpeqwXRegXReg>(x_min.machine_reg(), x_min.machine_reg());
+      builder_.Gen<x86_64::PsllwXRegImm>(x_min.machine_reg(), int8_t{15});  // INT16_MIN
+      builder_.Gen<x86_64::PmulhrswXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      builder_.Gen<x86_64::PcmpeqwXRegXReg>(xn_corner.machine_reg(), x_min.machine_reg());
+      builder_.Gen<x86_64::PcmpeqwXRegXReg>(xm_corner.machine_reg(), x_min.machine_reg());
+      builder_.Gen<x86_64::PandXRegXReg>(xn_corner.machine_reg(), xm_corner.machine_reg());
+      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xn_corner.machine_reg());
+      return xn;
+    }
+    // SQDMULH .4H/.8H via PMULHW + PMULLW combine + corner fixup (SSE2).
+    // high16(2*a*b) = (high16(a*b) << 1) | (top bit of low16(a*b)).
+    FpRegister xn_lo = AllocTempSimdReg();
+    FpRegister xn_corner = AllocTempSimdReg();
+    FpRegister xm_corner = AllocTempSimdReg();
+    FpRegister x_min = AllocZeroedSimdReg();  // pre-defined: self-Pcmpeqw idiom
+    builder_.Gen<x86_64::MovdqaXRegXReg>(xn_corner.machine_reg(), xn.machine_reg());
+    builder_.Gen<x86_64::MovdqaXRegXReg>(xm_corner.machine_reg(), xm.machine_reg());
+    builder_.Gen<x86_64::MovdqaXRegXReg>(xn_lo.machine_reg(), xn.machine_reg());
+    builder_.Gen<x86_64::PmullwXRegXReg>(xn_lo.machine_reg(), xm.machine_reg());  // low16(a*b)
+    builder_.Gen<x86_64::PmulhwXRegXReg>(xn.machine_reg(), xm.machine_reg());     // high16(a*b)
+    builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), int8_t{1});              // high<<1
+    builder_.Gen<x86_64::PsrlwXRegImm>(xn_lo.machine_reg(), int8_t{15});          // low top bit
+    builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), xn_lo.machine_reg());     // high16(2*a*b)
+    builder_.Gen<x86_64::PcmpeqwXRegXReg>(x_min.machine_reg(), x_min.machine_reg());
+    builder_.Gen<x86_64::PsllwXRegImm>(x_min.machine_reg(), int8_t{15});          // INT16_MIN
+    builder_.Gen<x86_64::PcmpeqwXRegXReg>(xn_corner.machine_reg(), x_min.machine_reg());
+    builder_.Gen<x86_64::PcmpeqwXRegXReg>(xm_corner.machine_reg(), x_min.machine_reg());
+    builder_.Gen<x86_64::PandXRegXReg>(xn_corner.machine_reg(), xm_corner.machine_reg());
+    builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xn_corner.machine_reg());  // INT16_MIN^0xFFFF=MAX
+    return xn;
+  }
+  // size=10 .2S/.4S: PMULDQ widen (SSE4.1) + PSLLQ double + optional round
+  // + corner fixup; PSHUFD 0xDD lifts each product's upper 32 bits.
+  FpRegister x_const = AllocZeroedSimdReg();  // pre-defined: self-Pcmpeqd idiom
+  FpRegister corner = AllocTempSimdReg();
+  FpRegister xp_lo = AllocTempSimdReg();
+  FpRegister xp_hi = AllocTempSimdReg();
+  FpRegister xm_hi = AllocTempSimdReg();
+  // x_const = INT32_MIN broadcast across 4 dwords.
+  builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_const.machine_reg(), x_const.machine_reg());
+  builder_.Gen<x86_64::PslldXRegImm>(x_const.machine_reg(), int8_t{31});
+  // Corner: lanes where Vn.s[i] == INT32_MIN AND Vm.s[i] == INT32_MIN.
+  builder_.Gen<x86_64::MovdqaXRegXReg>(corner.machine_reg(), xn.machine_reg());
+  builder_.Gen<x86_64::PcmpeqdXRegXReg>(corner.machine_reg(), x_const.machine_reg());
+  builder_.Gen<x86_64::MovdqaXRegXReg>(xp_lo.machine_reg(), xm.machine_reg());
+  builder_.Gen<x86_64::PcmpeqdXRegXReg>(xp_lo.machine_reg(), x_const.machine_reg());
+  builder_.Gen<x86_64::PandXRegXReg>(corner.machine_reg(), xp_lo.machine_reg());
+  // Two PMULDQs reconstruct the 4 signed 32x32 -> 64 products (even lanes
+  // in xp_lo, odd lanes in xp_hi).
+  builder_.Gen<x86_64::MovdqaXRegXReg>(xp_lo.machine_reg(), xn.machine_reg());
+  builder_.Gen<x86_64::PmuldqXRegXReg>(xp_lo.machine_reg(), xm.machine_reg());
+  builder_.Gen<x86_64::MovdqaXRegXReg>(xp_hi.machine_reg(), xn.machine_reg());
+  builder_.Gen<x86_64::PsrlqXRegImm>(xp_hi.machine_reg(), int8_t{32});
+  builder_.Gen<x86_64::MovdqaXRegXReg>(xm_hi.machine_reg(), xm.machine_reg());
+  builder_.Gen<x86_64::PsrlqXRegImm>(xm_hi.machine_reg(), int8_t{32});
+  builder_.Gen<x86_64::PmuldqXRegXReg>(xp_hi.machine_reg(), xm_hi.machine_reg());
+  // Double each 64-bit signed product.
+  builder_.Gen<x86_64::PsllqXRegImm>(xp_lo.machine_reg(), int8_t{1});
+  builder_.Gen<x86_64::PsllqXRegImm>(xp_hi.machine_reg(), int8_t{1});
+  if (is_round) {
+    // SQRDMULH: add rounding constant 2^31 = 0x80000000 per qword.
+    builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_const.machine_reg(), x_const.machine_reg());
+    builder_.Gen<x86_64::PsllqXRegImm>(x_const.machine_reg(), int8_t{63});
+    builder_.Gen<x86_64::PsrlqXRegImm>(x_const.machine_reg(), int8_t{32});
+    builder_.Gen<x86_64::PaddqXRegXReg>(xp_lo.machine_reg(), x_const.machine_reg());
+    builder_.Gen<x86_64::PaddqXRegXReg>(xp_hi.machine_reg(), x_const.machine_reg());
+  }
+  // Extract the upper 32 bits of each 64-bit lane and interleave.
+  builder_.Gen<x86_64::PshufdXRegXRegImm>(xp_lo.machine_reg(), xp_lo.machine_reg(), static_cast<int8_t>(0xDD));
+  builder_.Gen<x86_64::PshufdXRegXRegImm>(xp_hi.machine_reg(), xp_hi.machine_reg(), static_cast<int8_t>(0xDD));
+  builder_.Gen<x86_64::PunpckldqXRegXReg>(xp_lo.machine_reg(), xp_hi.machine_reg());
+  // Apply corner mask: INT32_MIN ^ 0xFFFFFFFF = INT32_MAX.
+  builder_.Gen<x86_64::PxorXRegXReg>(xp_lo.machine_reg(), corner.machine_reg());
+  return xp_lo;
+}
+
+// ARM FMAX/FMIN/FMAXNM/FMINNM per FP32/FP64 lane. x86 MINP{S,D}/MAXP{S,D}
+// return their second operand when either input is NaN or both are zeros of
+// either sign, while ARM orders -0 below +0 and FMAXNM/FMINNM return the
+// number when one input is NaN. FMAX is -FMIN(-a,-b), and the MIN is taken
+// both ways and ORed: a NaN in either keeps a NaN exponent, and a +-0 tie
+// keeps the minus sign. Shared by the vector, scalar and FP16 forms.
+HeavyOptimizerFrontend::FpRegister HeavyOptimizerFrontend::EmitArmFpMinMax(FpRegister n,
+                                                                           FpRegister m,
+                                                                           bool is_max,
+                                                                           bool is_nm,
+                                                                           bool is_double) {
+  // FMAX: negate both inputs so the shared FMIN lowering computes it; the
+  // per-lane sign mask (all-ones << 31/63) is XORed in now and, after the
+  // MIN, XORed back out of the result.
+  FpRegister sign_mask = no_fp_register;
+  if (is_max) {
+    // AllocZeroedSimdReg establishes a def before the all-ones self-compare
+    // (a bare AllocTempSimdReg would trip the lifetime use-before-def CHECK).
+    sign_mask = AllocZeroedSimdReg();
+    builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign_mask.machine_reg(), sign_mask.machine_reg());
+    if (is_double) {
+      builder_.Gen<x86_64::PsllqXRegImm>(sign_mask.machine_reg(), int8_t{63});
+    } else {
+      builder_.Gen<x86_64::PslldXRegImm>(sign_mask.machine_reg(), int8_t{31});
+    }
+    builder_.Gen<x86_64::PxorXRegXReg>(n.machine_reg(), sign_mask.machine_reg());
+    builder_.Gen<x86_64::PxorXRegXReg>(m.machine_reg(), sign_mask.machine_reg());
+  }
+  auto gen_min = [&](FpRegister dst, FpRegister src) {
+    if (is_double) {
+      builder_.Gen<x86_64::MinpdXRegXReg>(dst.machine_reg(), src.machine_reg());
+    } else {
+      builder_.Gen<x86_64::MinpsXRegXReg>(dst.machine_reg(), src.machine_reg());
+    }
+  };
+  auto gen_cmpunord = [&](FpRegister dst, FpRegister src) {
+    if (is_double) {
+      builder_.Gen<x86_64::CmpunordpdXRegXReg>(dst.machine_reg(), src.machine_reg());
+    } else {
+      builder_.Gen<x86_64::CmpunordpsXRegXReg>(dst.machine_reg(), src.machine_reg());
+    }
+  };
+  FpRegister result;
+  if (!is_nm) {
+    // NaN-propagating: tmp = m; MIN(tmp, n); MIN(n, m); POR(n, tmp).
+    FpRegister tmp = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovdqaXRegXReg>(tmp.machine_reg(), m.machine_reg());
+    gen_min(tmp, n);
+    gen_min(n, m);
+    builder_.Gen<x86_64::PorXRegXReg>(n.machine_reg(), tmp.machine_reg());
+    result = n;
+  } else {
+    // NaN-suppressing: substitute each NaN lane with the other operand
+    // (a' = select(isnan(a), b, a); b' = select(isnan(b), a, b)), then MIN.
+    FpRegister mask_a = AllocTempSimdReg();
+    FpRegister mask_b = AllocTempSimdReg();
+    FpRegister an_sub = AllocTempSimdReg();
+    FpRegister bn_sub = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovdqaXRegXReg>(mask_a.machine_reg(), n.machine_reg());
+    gen_cmpunord(mask_a, mask_a);  // 1s where a is NaN
+    builder_.Gen<x86_64::MovdqaXRegXReg>(mask_b.machine_reg(), m.machine_reg());
+    gen_cmpunord(mask_b, mask_b);  // 1s where b is NaN
+    builder_.Gen<x86_64::MovdqaXRegXReg>(an_sub.machine_reg(), mask_a.machine_reg());
+    builder_.Gen<x86_64::PandXRegXReg>(an_sub.machine_reg(), m.machine_reg());  // mask_a & b
+    builder_.Gen<x86_64::MovdqaXRegXReg>(bn_sub.machine_reg(), mask_b.machine_reg());
+    builder_.Gen<x86_64::PandXRegXReg>(bn_sub.machine_reg(), n.machine_reg());  // mask_b & a
+    builder_.Gen<x86_64::PandnXRegXReg>(mask_a.machine_reg(), n.machine_reg());  // ~mask_a & a
+    builder_.Gen<x86_64::PandnXRegXReg>(mask_b.machine_reg(), m.machine_reg());  // ~mask_b & b
+    builder_.Gen<x86_64::PorXRegXReg>(mask_a.machine_reg(), an_sub.machine_reg());  // a'
+    builder_.Gen<x86_64::PorXRegXReg>(mask_b.machine_reg(), bn_sub.machine_reg());  // b'
+    // minab|minba|OR so the +-0 tie gets OR-of-signs (ARM's FMINNM rule);
+    // operands are NaN-free here (NaN lanes were substituted above).
+    FpRegister t_nm = AllocTempSimdReg();
+    builder_.Gen<x86_64::MovdqaXRegXReg>(t_nm.machine_reg(), mask_b.machine_reg());
+    gen_min(t_nm, mask_a);      // min(b', a')
+    gen_min(mask_a, mask_b);    // min(a', b')
+    builder_.Gen<x86_64::PorXRegXReg>(mask_a.machine_reg(), t_nm.machine_reg());
+    result = mask_a;
+  }
+  // Negate the FMIN result back to obtain FMAX = -FMIN(-a,-b).
+  if (is_max) {
+    builder_.Gen<x86_64::PxorXRegXReg>(result.machine_reg(), sign_mask.machine_reg());
+  }
+  return result;
+}
+
 // AdvSIMD three-same INTEGER ops that lower to a single packed SSE2/SSE4.1
 // instruction: ADD, SUB, AND, ORR, EOR, MUL, and CMEQ (register). Each loads
 // the full 128-bit Vn and Vm with GenGetSimd<16> (MOVDQA), runs the packed op
@@ -6241,16 +6767,8 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     return;
   }
 
-  // FP vector FMAX/FMIN/FMAXNM/FMINNM (.2S/.4S/.2D). x86 MAXP{S,D}/MINP{S,D}
-  // disagree with ARM on both NaN and signed-zero results, so mirror
-  // lite_translator.h's vector sequence exactly. Everything is computed as
-  // FMIN (FMAX = -FMIN(-a,-b)): x86 MINP{S,D} returns the SECOND source on a
-  // +-0 tie, which gives ARM's OR-of-signs (most-negative) for FMIN and, after
-  // the double negation, AND-of-signs (most-positive) for FMAX. NaN-propagating
-  // FMAX/FMIN (any NaN in -> NaN out) use the symmetric MIN|MIN|POR idiom;
-  // NaN-suppressing FMAXNM/FMINNM (exactly one NaN -> the number) substitute
-  // each NaN lane with the other operand via a CMPUNORDP{S,D} self-compare mask
-  // before the MIN. FP16 (is_fp16, needs an F16C round-trip not in the backend
+  // FP vector FMAX/FMIN/FMAXNM/FMINNM (.2S/.4S/.2D) through EmitArmFpMinMax,
+  // which mirrors lite_translator.h's vector sequence. FP16 (is_fp16, needs an F16C round-trip not in the backend
   // gen inputs) bails to lite; the decoder already filters the reserved
   // sz=1&&!Q (.1D) shape, so only .2S/.4S/.2D reach here.
   if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFmaxV ||
@@ -6349,78 +6867,7 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     FpRegister xm = AllocTempSimdReg();
     builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
     builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
-    // FMAX: negate both inputs so the shared FMIN lowering computes it; the
-    // per-lane sign mask (all-ones << 31/63) is XORed in now and, after the
-    // MIN, XORed back out of the result.
-    FpRegister sign_mask = no_fp_register;
-    if (is_max) {
-      // AllocZeroedSimdReg establishes a def before the all-ones self-compare
-      // (a bare AllocTempSimdReg would trip the lifetime use-before-def CHECK).
-      sign_mask = AllocZeroedSimdReg();
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(sign_mask.machine_reg(), sign_mask.machine_reg());
-      if (is_double) {
-        builder_.Gen<x86_64::PsllqXRegImm>(sign_mask.machine_reg(), int8_t{63});
-      } else {
-        builder_.Gen<x86_64::PslldXRegImm>(sign_mask.machine_reg(), int8_t{31});
-      }
-      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), sign_mask.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(xm.machine_reg(), sign_mask.machine_reg());
-    }
-    auto gen_min = [&](FpRegister dst, FpRegister src) {
-      if (is_double) {
-        builder_.Gen<x86_64::MinpdXRegXReg>(dst.machine_reg(), src.machine_reg());
-      } else {
-        builder_.Gen<x86_64::MinpsXRegXReg>(dst.machine_reg(), src.machine_reg());
-      }
-    };
-    auto gen_cmpunord = [&](FpRegister dst, FpRegister src) {
-      if (is_double) {
-        builder_.Gen<x86_64::CmpunordpdXRegXReg>(dst.machine_reg(), src.machine_reg());
-      } else {
-        builder_.Gen<x86_64::CmpunordpsXRegXReg>(dst.machine_reg(), src.machine_reg());
-      }
-    };
-    FpRegister result;
-    if (!is_nm) {
-      // NaN-propagating: tmp = xm; MIN(tmp, xn); MIN(xn, xm); POR(xn, tmp).
-      FpRegister tmp = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(tmp.machine_reg(), xm.machine_reg());
-      gen_min(tmp, xn);
-      gen_min(xn, xm);
-      builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), tmp.machine_reg());
-      result = xn;
-    } else {
-      // NaN-suppressing: substitute each NaN lane with the other operand
-      // (a' = select(isnan(a), b, a); b' = select(isnan(b), a, b)), then MIN.
-      FpRegister mask_a = AllocTempSimdReg();
-      FpRegister mask_b = AllocTempSimdReg();
-      FpRegister an_sub = AllocTempSimdReg();
-      FpRegister bn_sub = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(mask_a.machine_reg(), xn.machine_reg());
-      gen_cmpunord(mask_a, mask_a);  // 1s where a is NaN
-      builder_.Gen<x86_64::MovdqaXRegXReg>(mask_b.machine_reg(), xm.machine_reg());
-      gen_cmpunord(mask_b, mask_b);  // 1s where b is NaN
-      builder_.Gen<x86_64::MovdqaXRegXReg>(an_sub.machine_reg(), mask_a.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(an_sub.machine_reg(), xm.machine_reg());  // mask_a & b
-      builder_.Gen<x86_64::MovdqaXRegXReg>(bn_sub.machine_reg(), mask_b.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(bn_sub.machine_reg(), xn.machine_reg());  // mask_b & a
-      builder_.Gen<x86_64::PandnXRegXReg>(mask_a.machine_reg(), xn.machine_reg());  // ~mask_a & a
-      builder_.Gen<x86_64::PandnXRegXReg>(mask_b.machine_reg(), xm.machine_reg());  // ~mask_b & b
-      builder_.Gen<x86_64::PorXRegXReg>(mask_a.machine_reg(), an_sub.machine_reg());  // a'
-      builder_.Gen<x86_64::PorXRegXReg>(mask_b.machine_reg(), bn_sub.machine_reg());  // b'
-      // minab|minba|OR so the +-0 tie gets OR-of-signs (ARM's FMINNM rule);
-      // operands are NaN-free here (NaN lanes were substituted above).
-      FpRegister t_nm = AllocTempSimdReg();
-      builder_.Gen<x86_64::MovdqaXRegXReg>(t_nm.machine_reg(), mask_b.machine_reg());
-      gen_min(t_nm, mask_a);      // min(b', a')
-      gen_min(mask_a, mask_b);    // min(a', b')
-      builder_.Gen<x86_64::PorXRegXReg>(mask_a.machine_reg(), t_nm.machine_reg());
-      result = mask_a;
-    }
-    // Negate the FMIN result back to obtain FMAX = -FMIN(-a,-b).
-    if (is_max) {
-      builder_.Gen<x86_64::PxorXRegXReg>(result.machine_reg(), sign_mask.machine_reg());
-    }
+    FpRegister result = EmitArmFpMinMax(xn, xm, is_max, is_nm, is_double);
     // Q=0 (.2S) zeroes Vd[127:64] via SetVRegFull's D-form merge.
     SetVRegFull(args.rd, result, args.q);
     return;
@@ -6527,11 +6974,35 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     return;
   }
 
+  // FP32/FP64 vector FADDP (.2S/.4S/.2D). HADDPS xn, xm gives [n0+n1, n2+n3,
+  // m0+m1, m2+m3], the .4S result in ARM lane order, and HADDPD gives [n0+n1,
+  // m0+m1] for .2D; each lane is one IEEE add, like ADDPS in FADD above. .2S
+  // reads only the low 64 bits of each source, so its result [n0+n1, m0+m1]
+  // sits in HADDPS lanes 0 and 2 and one PSHUFD gathers it before the D-form
+  // merge zeroes Vd[127:64]. Mirrors lite_translator_simd_three_same.inc.
+  if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFaddpV && !args.is_fp16) {
+    FpRegister xn = AllocTempSimdReg();
+    FpRegister xm = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+    builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+    if (args.size & 1) {
+      builder_.Gen<x86_64::HaddpdXRegXReg>(xn.machine_reg(), xm.machine_reg());
+    } else {
+      builder_.Gen<x86_64::HaddpsXRegXReg>(xn.machine_reg(), xm.machine_reg());
+      if (!args.q) {
+        builder_.Gen<x86_64::PshufdXRegXRegImm>(xn.machine_reg(), xn.machine_reg(),
+                                                static_cast<int8_t>(0x08));
+      }
+    }
+    SetVRegFull(args.rd, xn, args.q);
+    return;
+  }
+
   // FP16 vector pairwise FADDP/FMAXP/FMINP/FMAXNMP/FMINNMP (.4H/.8H) via the F16C
   // round-trip. Result lane k reduces the pair (cat[2k], cat[2k+1]) of the
   // concatenation cat = Vn:Vm — Vd's low half comes from Vn's adjacent pairs, its
-  // high half from Vm's. FP32/FP64 vector pairwise is not lowered here (bails to
-  // lite->interp); only the FP16 half is added, guarded on is_fp16. FADDP folds
+  // high half from Vm's. FP32/FP64 FMAXP/FMINP/FMAXNMP/FMINNMP are not lowered
+  // here (bail to lite); FP32/FP64 FADDP is handled above. FADDP folds
   // with HADDPS; min/max forms gather even/odd cat elements with SHUFPS (0x88/
   // 0xDD, same as UZP1/UZP2) and apply the +-0-correct NaN-aware min/max.
   if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kFaddpV ||
@@ -6819,7 +7290,7 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
   // built with the PCMPEQD-self ; PSRLD/PSRLQ 1 idiom. FP16 (needs an F16C
   // round-trip absent from the backend Gen inputs) bails to lite; the decoder
   // already rejects the reserved sz=1&&!Q (.1D) shape.
-  // SSHL / USHL (vector, 32- and 64-bit lanes). Per-lane variable shift: the
+  // SSHL / USHL (vector, 16-, 32- and 64-bit lanes). Per-lane variable shift: the
   // amount is the signed low BYTE of each Vm lane, left when non-negative,
   // plain (non-rounding) right when negative -- arithmetic for SSHL, logical
   // for USHL. The bail histogram over real apps put USHL.2D at the top of the
@@ -6836,11 +7307,17 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
   //     sar(v, s) = ((v ^ m) >>logical s) ^ m with m = (v < 0 ? ~0 : 0) from
   //     PCMPGTQ -- for s >= 64 the logical shift gives 0 and the XOR restores
   //     the sign fill, exactly ARM's semantics.
-  // 8/16-bit lanes have no variable-shift instruction below AVX-512 and bail.
+  // 16-bit lanes reuse the dword arm twice: the low halfwords, extended to
+  // dwords (zero for USHL, sign for SSHL) with their own sext8 counts, and the
+  // high halfwords likewise; a dword shift of an extended halfword gives the
+  // ARM halfword result in its low 16 bits for every count (left counts >= 16
+  // clear it; logical rights of a zero-extended value and VPSRAVD's sign fill
+  // of a sign-extended one match ARM's 16-bit right shifts), and the two
+  // halves are merged back. 8-bit lanes have no such cheap split and bail.
   if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSshl ||
       args.opcode == Decoder::AdvSimdThreeSameOpcode::kUshl) {
     const bool is_64bit = (args.size == 0b11);
-    if ((args.size != 0b10 && args.size != 0b11) || !host_platform::kHasAVX2) {
+    if (args.size == 0b00 || !host_platform::kHasAVX2) {
       UndefinedReturningVoid();
       return;
     }
@@ -6855,27 +7332,25 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
     builder_.GenGetSimd<16>(xa.machine_reg(), vn_off);
     builder_.GenGetSimd<16>(xsh.machine_reg(), vm_off);
 
-    if (!is_64bit) {
-      // shift = sext8(Vm.lane[7:0]) per dword.
-      builder_.Gen<x86_64::PslldXRegImm>(xsh.machine_reg(), int8_t{24});
-      builder_.Gen<x86_64::PsradXRegImm>(xsh.machine_reg(), int8_t{24});
-
+    // Per-dword variable shift of xa by the signed counts in xsh (already
+    // sign-extended to dwords).
+    auto shift_dwords = [&](FpRegister xv, FpRegister xcount) {
       FpRegister xisneg = AllocZeroedSimdReg();
-      builder_.Gen<x86_64::PcmpgtdXRegXReg>(xisneg.machine_reg(), xsh.machine_reg());
+      builder_.Gen<x86_64::PcmpgtdXRegXReg>(xisneg.machine_reg(), xcount.machine_reg());
 
       FpRegister xleft = AllocTempSimdReg();
       builder_.Gen<x86_64::VpsllvdXRegXRegXReg>(
-          xleft.machine_reg(), xa.machine_reg(), xsh.machine_reg());
+          xleft.machine_reg(), xv.machine_reg(), xcount.machine_reg());
 
       FpRegister xs = AllocZeroedSimdReg();
-      builder_.Gen<x86_64::PsubdXRegXReg>(xs.machine_reg(), xsh.machine_reg());
+      builder_.Gen<x86_64::PsubdXRegXReg>(xs.machine_reg(), xcount.machine_reg());
       FpRegister xright = AllocTempSimdReg();
       if (is_signed) {
         builder_.Gen<x86_64::VpsravdXRegXRegXReg>(
-            xright.machine_reg(), xa.machine_reg(), xs.machine_reg());
+            xright.machine_reg(), xv.machine_reg(), xs.machine_reg());
       } else {
         builder_.Gen<x86_64::VpsrlvdXRegXRegXReg>(
-            xright.machine_reg(), xa.machine_reg(), xs.machine_reg());
+            xright.machine_reg(), xv.machine_reg(), xs.machine_reg());
       }
 
       FpRegister xres = AllocTempSimdReg();
@@ -6883,7 +7358,46 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
       builder_.Gen<x86_64::PandXRegXReg>(xres.machine_reg(), xright.machine_reg());
       builder_.Gen<x86_64::PandnXRegXReg>(xisneg.machine_reg(), xleft.machine_reg());
       builder_.Gen<x86_64::PorXRegXReg>(xres.machine_reg(), xisneg.machine_reg());
-      SetVRegFull(args.rd, xres, args.q);
+      return xres;
+    };
+
+    if (args.size == 0b10) {
+      // shift = sext8(Vm.lane[7:0]) per dword.
+      builder_.Gen<x86_64::PslldXRegImm>(xsh.machine_reg(), int8_t{24});
+      builder_.Gen<x86_64::PsradXRegImm>(xsh.machine_reg(), int8_t{24});
+      SetVRegFull(args.rd, shift_dwords(xa, xsh), args.q);
+      return;
+    }
+
+    if (args.size == 0b01) {
+      // Low halfwords: value extended from bits [15:0], count sext8 of bits [7:0].
+      FpRegister xlo = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xlo.machine_reg(), xa.machine_reg());
+      builder_.Gen<x86_64::PslldXRegImm>(xlo.machine_reg(), int8_t{16});
+      FpRegister xclo = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xclo.machine_reg(), xsh.machine_reg());
+      builder_.Gen<x86_64::PslldXRegImm>(xclo.machine_reg(), int8_t{24});
+      builder_.Gen<x86_64::PsradXRegImm>(xclo.machine_reg(), int8_t{24});
+      // High halfwords: value extended from bits [31:16], count sext8 of bits [23:16].
+      FpRegister xhi = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(xhi.machine_reg(), xa.machine_reg());
+      builder_.Gen<x86_64::PslldXRegImm>(xsh.machine_reg(), int8_t{8});
+      builder_.Gen<x86_64::PsradXRegImm>(xsh.machine_reg(), int8_t{24});
+      if (is_signed) {
+        builder_.Gen<x86_64::PsradXRegImm>(xlo.machine_reg(), int8_t{16});
+        builder_.Gen<x86_64::PsradXRegImm>(xhi.machine_reg(), int8_t{16});
+      } else {
+        builder_.Gen<x86_64::PsrldXRegImm>(xlo.machine_reg(), int8_t{16});
+        builder_.Gen<x86_64::PsrldXRegImm>(xhi.machine_reg(), int8_t{16});
+      }
+      FpRegister xrlo = shift_dwords(xlo, xclo);
+      FpRegister xrhi = shift_dwords(xhi, xsh);
+      // Merge: low 16 bits of each dword result into their halfword slots.
+      builder_.Gen<x86_64::PslldXRegImm>(xrlo.machine_reg(), int8_t{16});
+      builder_.Gen<x86_64::PsrldXRegImm>(xrlo.machine_reg(), int8_t{16});
+      builder_.Gen<x86_64::PslldXRegImm>(xrhi.machine_reg(), int8_t{16});
+      builder_.Gen<x86_64::PorXRegXReg>(xrlo.machine_reg(), xrhi.machine_reg());
+      SetVRegFull(args.rd, xrlo, args.q);
       return;
     }
 
@@ -7487,120 +8001,22 @@ void HeavyOptimizerFrontend::AdvSimdThreeSame(const Decoder::AdvSimdThreeSameArg
   // Only the 16-bit (size=01) and 32-bit (size=10) lane forms are defined; the
   // decoder reserves size 00/11, so those bail. This is a byte-for-byte mirror
   // of lite_translator.h's kSqdmulh/kSqrdmulh lowering — reads only Vn/Vm, so
-  // it lives here (like SQADD) rather than the shared vn-only switch. Result
-  // lands in xn (size=01) / xp_lo (size=10); SetVRegFull's Q=0 merge zeroes
-  // Vd[127:64].
+  // it lives here (like SQADD) rather than the shared vn-only switch. The
+  // recipe is EmitSqdmulhVec; SetVRegFull's Q=0 merge zeroes Vd[127:64].
   if (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqdmulh ||
       args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqrdmulh) {
     const bool is_round =
         (args.opcode == Decoder::AdvSimdThreeSameOpcode::kSqrdmulh);
-    if (args.size == 0b01) {
-      FpRegister xn = AllocTempSimdReg();
-      FpRegister xm = AllocTempSimdReg();
-      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
-      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
-      if (is_round) {
-        // SQRDMULH .4H/.8H via PMULHRSW + corner fixup (SSSE3). PMULHRSW
-        // computes ((a*b >> 14) + 1) >> 1 = round((2*a*b)/2^16) already, so
-        // only the INT16_MIN*INT16_MIN corner needs the ^0xFFFF flip.
-        if (!host_platform::kHasSSSE3) {
-          UndefinedReturningVoid();
-          return;
-        }
-        FpRegister xn_corner = AllocTempSimdReg();
-        FpRegister xm_corner = AllocTempSimdReg();
-        FpRegister x_min = AllocZeroedSimdReg();  // pre-defined: self-Pcmpeqw idiom
-        builder_.Gen<x86_64::MovdqaXRegXReg>(xn_corner.machine_reg(), xn.machine_reg());
-        builder_.Gen<x86_64::MovdqaXRegXReg>(xm_corner.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PcmpeqwXRegXReg>(x_min.machine_reg(), x_min.machine_reg());
-        builder_.Gen<x86_64::PsllwXRegImm>(x_min.machine_reg(), int8_t{15});  // INT16_MIN
-        builder_.Gen<x86_64::PmulhrswXRegXReg>(xn.machine_reg(), xm.machine_reg());
-        builder_.Gen<x86_64::PcmpeqwXRegXReg>(xn_corner.machine_reg(), x_min.machine_reg());
-        builder_.Gen<x86_64::PcmpeqwXRegXReg>(xm_corner.machine_reg(), x_min.machine_reg());
-        builder_.Gen<x86_64::PandXRegXReg>(xn_corner.machine_reg(), xm_corner.machine_reg());
-        builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xn_corner.machine_reg());
-        SetVRegFull(args.rd, xn, args.q);
-        return;
-      }
-      // SQDMULH .4H/.8H via PMULHW + PMULLW combine + corner fixup (SSE2).
-      // high16(2*a*b) = (high16(a*b) << 1) | (top bit of low16(a*b)).
-      FpRegister xn_lo = AllocTempSimdReg();
-      FpRegister xn_corner = AllocTempSimdReg();
-      FpRegister xm_corner = AllocTempSimdReg();
-      FpRegister x_min = AllocZeroedSimdReg();  // pre-defined: self-Pcmpeqw idiom
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xn_corner.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xm_corner.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xn_lo.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PmullwXRegXReg>(xn_lo.machine_reg(), xm.machine_reg());  // low16(a*b)
-      builder_.Gen<x86_64::PmulhwXRegXReg>(xn.machine_reg(), xm.machine_reg());     // high16(a*b)
-      builder_.Gen<x86_64::PsllwXRegImm>(xn.machine_reg(), int8_t{1});              // high<<1
-      builder_.Gen<x86_64::PsrlwXRegImm>(xn_lo.machine_reg(), int8_t{15});          // low top bit
-      builder_.Gen<x86_64::PorXRegXReg>(xn.machine_reg(), xn_lo.machine_reg());     // high16(2*a*b)
-      builder_.Gen<x86_64::PcmpeqwXRegXReg>(x_min.machine_reg(), x_min.machine_reg());
-      builder_.Gen<x86_64::PsllwXRegImm>(x_min.machine_reg(), int8_t{15});          // INT16_MIN
-      builder_.Gen<x86_64::PcmpeqwXRegXReg>(xn_corner.machine_reg(), x_min.machine_reg());
-      builder_.Gen<x86_64::PcmpeqwXRegXReg>(xm_corner.machine_reg(), x_min.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(xn_corner.machine_reg(), xm_corner.machine_reg());
-      builder_.Gen<x86_64::PxorXRegXReg>(xn.machine_reg(), xn_corner.machine_reg());  // INT16_MIN^0xFFFF=MAX
-      SetVRegFull(args.rd, xn, args.q);
+    // size=00 and size=11 are reserved by the decoder; bail to lite/interp.
+    if (!SqdmulhVecSupported(args.size, is_round)) {
+      UndefinedReturningVoid();
       return;
     }
-    if (args.size == 0b10) {
-      // size=10 .2S/.4S: PMULDQ widen (SSE4.1) + PSLLQ double + optional round
-      // + corner fixup; PSHUFD 0xDD lifts each product's upper 32 bits.
-      if (!host_platform::kHasSSE4_1) {
-        UndefinedReturningVoid();
-        return;
-      }
-      FpRegister xn = AllocTempSimdReg();
-      FpRegister xm = AllocTempSimdReg();
-      FpRegister x_const = AllocZeroedSimdReg();  // pre-defined: self-Pcmpeqd idiom
-      FpRegister corner = AllocTempSimdReg();
-      FpRegister xp_lo = AllocTempSimdReg();
-      FpRegister xp_hi = AllocTempSimdReg();
-      FpRegister xm_hi = AllocTempSimdReg();
-      builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
-      builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
-      // x_const = INT32_MIN broadcast across 4 dwords.
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_const.machine_reg(), x_const.machine_reg());
-      builder_.Gen<x86_64::PslldXRegImm>(x_const.machine_reg(), int8_t{31});
-      // Corner: lanes where Vn.s[i] == INT32_MIN AND Vm.s[i] == INT32_MIN.
-      builder_.Gen<x86_64::MovdqaXRegXReg>(corner.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(corner.machine_reg(), x_const.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xp_lo.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::PcmpeqdXRegXReg>(xp_lo.machine_reg(), x_const.machine_reg());
-      builder_.Gen<x86_64::PandXRegXReg>(corner.machine_reg(), xp_lo.machine_reg());
-      // Two PMULDQs reconstruct the 4 signed 32x32 -> 64 products (even lanes
-      // in xp_lo, odd lanes in xp_hi).
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xp_lo.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PmuldqXRegXReg>(xp_lo.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xp_hi.machine_reg(), xn.machine_reg());
-      builder_.Gen<x86_64::PsrlqXRegImm>(xp_hi.machine_reg(), int8_t{32});
-      builder_.Gen<x86_64::MovdqaXRegXReg>(xm_hi.machine_reg(), xm.machine_reg());
-      builder_.Gen<x86_64::PsrlqXRegImm>(xm_hi.machine_reg(), int8_t{32});
-      builder_.Gen<x86_64::PmuldqXRegXReg>(xp_hi.machine_reg(), xm_hi.machine_reg());
-      // Double each 64-bit signed product.
-      builder_.Gen<x86_64::PsllqXRegImm>(xp_lo.machine_reg(), int8_t{1});
-      builder_.Gen<x86_64::PsllqXRegImm>(xp_hi.machine_reg(), int8_t{1});
-      if (is_round) {
-        // SQRDMULH: add rounding constant 2^31 = 0x80000000 per qword.
-        builder_.Gen<x86_64::PcmpeqdXRegXReg>(x_const.machine_reg(), x_const.machine_reg());
-        builder_.Gen<x86_64::PsllqXRegImm>(x_const.machine_reg(), int8_t{63});
-        builder_.Gen<x86_64::PsrlqXRegImm>(x_const.machine_reg(), int8_t{32});
-        builder_.Gen<x86_64::PaddqXRegXReg>(xp_lo.machine_reg(), x_const.machine_reg());
-        builder_.Gen<x86_64::PaddqXRegXReg>(xp_hi.machine_reg(), x_const.machine_reg());
-      }
-      // Extract the upper 32 bits of each 64-bit lane and interleave.
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(xp_lo.machine_reg(), xp_lo.machine_reg(), static_cast<int8_t>(0xDD));
-      builder_.Gen<x86_64::PshufdXRegXRegImm>(xp_hi.machine_reg(), xp_hi.machine_reg(), static_cast<int8_t>(0xDD));
-      builder_.Gen<x86_64::PunpckldqXRegXReg>(xp_lo.machine_reg(), xp_hi.machine_reg());
-      // Apply corner mask: INT32_MIN ^ 0xFFFFFFFF = INT32_MAX.
-      builder_.Gen<x86_64::PxorXRegXReg>(xp_lo.machine_reg(), corner.machine_reg());
-      SetVRegFull(args.rd, xp_lo, args.q);
-      return;
-    }
-    // size=00 and size=11 reserved by the decoder; bail to lite/interp.
-    UndefinedReturningVoid();
+    FpRegister xn = AllocTempSimdReg();
+    FpRegister xm = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
+    builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
+    SetVRegFull(args.rd, EmitSqdmulhVec(xn, xm, args.size, is_round), args.q);
     return;
   }
 
@@ -10541,16 +10957,9 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
     // FMAXV / FMINV / FMAXNMV / FMINNMV Sd, Vn.4S — floating-point across-lanes
     // reduction. Reduce the 4 FP32 lanes to a single scalar written to Sd's low
     // lane with the upper 96 bits zeroed. Two pairwise steps (PSHUFD 0x4E then
-    // 0xB1) each fold lanes together via the same NaN-handling min/max idioms the
-    // vector three-same FMAX/FMIN path uses (lines ~1828):
-    //   FMAXV/FMINV       — NaN-propagating: tmp=b; MAX/MIN tmp,a; MAX/MIN a,b;
-    //                        POR a,tmp. (x86 MAX/MINPS returns src on NaN, so the
-    //                        two-sided op + POR keeps a NaN exponent if either
-    //                        input was NaN and makes +-0 order-independent.)
-    //   FMAXNMV/FMINNMV   — NaN-suppressing: substitute each NaN lane with the
-    //                        other operand via a CMPUNORDPS self-compare mask,
-    //                        then MAX/MIN. Mirrors the interpreter FmaxScalar /
-    //                        FmaxnmScalar reduction. The Armv8.2 FP16 (.4H/.8H)
+    // 0xB1) each fold lanes together through EmitArmFpMinMax, the vector
+    // three-same FMAX/FMIN/FMAXNM/FMINNM lowering, which mirrors the
+    // interpreter FmaxScalar / FmaxnmScalar reduction. The Armv8.2 FP16 (.4H/.8H)
     //                        form is handled separately just below, through the
     //                        F16C round-trip.
     case Decoder::AdvSimdTwoRegMiscOpcode::kFmaxv:
@@ -10615,52 +11024,14 @@ void HeavyOptimizerFrontend::AdvSimdTwoRegMisc(const Decoder::AdvSimdTwoRegMiscA
       FpRegister xn = AllocTempSimdReg();
       FpRegister xt = AllocTempSimdReg();
       builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
-      // Fold b (=xt) into a (=xn) with FP32 packed NaN-aware min/max.
-      auto EmitPairFp = [&](FpRegister a, FpRegister b) {
-        if (!is_nm) {
-          FpRegister tmp = AllocTempSimdReg();
-          builder_.Gen<x86_64::MovdqaXRegXReg>(tmp.machine_reg(), b.machine_reg());
-          if (is_max) {
-            builder_.Gen<x86_64::MaxpsXRegXReg>(tmp.machine_reg(), a.machine_reg());
-            builder_.Gen<x86_64::MaxpsXRegXReg>(a.machine_reg(), b.machine_reg());
-          } else {
-            builder_.Gen<x86_64::MinpsXRegXReg>(tmp.machine_reg(), a.machine_reg());
-            builder_.Gen<x86_64::MinpsXRegXReg>(a.machine_reg(), b.machine_reg());
-          }
-          builder_.Gen<x86_64::PorXRegXReg>(a.machine_reg(), tmp.machine_reg());
-        } else {
-          FpRegister mask_a = AllocTempSimdReg();
-          FpRegister mask_b = AllocTempSimdReg();
-          FpRegister an_sub = AllocTempSimdReg();
-          FpRegister bn_sub = AllocTempSimdReg();
-          builder_.Gen<x86_64::MovdqaXRegXReg>(mask_a.machine_reg(), a.machine_reg());
-          builder_.Gen<x86_64::MovdqaXRegXReg>(mask_b.machine_reg(), b.machine_reg());
-          builder_.Gen<x86_64::CmpunordpsXRegXReg>(mask_a.machine_reg(), mask_a.machine_reg());
-          builder_.Gen<x86_64::CmpunordpsXRegXReg>(mask_b.machine_reg(), mask_b.machine_reg());
-          builder_.Gen<x86_64::MovdqaXRegXReg>(an_sub.machine_reg(), mask_a.machine_reg());
-          builder_.Gen<x86_64::PandXRegXReg>(an_sub.machine_reg(), b.machine_reg());
-          builder_.Gen<x86_64::MovdqaXRegXReg>(bn_sub.machine_reg(), mask_b.machine_reg());
-          builder_.Gen<x86_64::PandXRegXReg>(bn_sub.machine_reg(), a.machine_reg());
-          builder_.Gen<x86_64::PandnXRegXReg>(mask_a.machine_reg(), a.machine_reg());
-          builder_.Gen<x86_64::PandnXRegXReg>(mask_b.machine_reg(), b.machine_reg());
-          builder_.Gen<x86_64::PorXRegXReg>(mask_a.machine_reg(), an_sub.machine_reg());
-          builder_.Gen<x86_64::PorXRegXReg>(mask_b.machine_reg(), bn_sub.machine_reg());
-          if (is_max) {
-            builder_.Gen<x86_64::MaxpsXRegXReg>(mask_a.machine_reg(), mask_b.machine_reg());
-          } else {
-            builder_.Gen<x86_64::MinpsXRegXReg>(mask_a.machine_reg(), mask_b.machine_reg());
-          }
-          builder_.Gen<x86_64::MovdqaXRegXReg>(a.machine_reg(), mask_a.machine_reg());
-        }
-      };
       // Step 1: fold lanes {2,3} into {0,1}. PSHUFD 0x4E swaps the 64-bit halves.
       builder_.Gen<x86_64::PshufdXRegXRegImm>(
           xt.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0x4E));
-      EmitPairFp(xn, xt);
+      xn = EmitArmFpMinMax(xn, xt, is_max, is_nm, /*is_double=*/false);
       // Step 2: fold lane 1 into lane 0. PSHUFD 0xB1 swaps adjacent dwords.
       builder_.Gen<x86_64::PshufdXRegXRegImm>(
           xt.machine_reg(), xn.machine_reg(), static_cast<int8_t>(0xB1));
-      EmitPairFp(xn, xt);
+      xn = EmitArmFpMinMax(xn, xt, is_max, is_nm, /*is_double=*/false);
       // Keep only the low 32-bit result lane; zero the upper 96 bits.
       builder_.Gen<x86_64::PslldqXRegImm>(xn.machine_reg(), int8_t{12});
       builder_.Gen<x86_64::PsrldqXRegImm>(xn.machine_reg(), int8_t{12});
@@ -14304,6 +14675,23 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
   }
 }
 
+// Broadcast lane `index` of xm (16-bit lanes when is_halfword, else 32-bit)
+// across every lane: PSRLDQ 8 for a high halfword lane, then PSHUFLW + PSHUFD
+// for halfwords, or one PSHUFD for words.
+void HeavyOptimizerFrontend::EmitBroadcastVmLane(FpRegister xm, bool is_halfword, uint8_t index) {
+  const uint8_t i = index & 0b11;
+  const int8_t imm = static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
+  if (is_halfword) {
+    if (index >= 4) {
+      builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
+    }
+    builder_.Gen<x86_64::PshuflwXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
+    builder_.Gen<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), int8_t{0x44});
+  } else {
+    builder_.Gen<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
+  }
+}
+
 // Heavy-tier mirror of lite_translator.h::AdvSimdVecXIndexedElement's
 // integer MUL/MLA/MLS by-element block (halfword .4h/.8h size=01, word
 // .2s/.4s size=10):
@@ -14313,7 +14701,8 @@ void HeavyOptimizerFrontend::AdvSimdShiftByImm(const Decoder::AdvSimdShiftImmArg
 // No saturation, no widening — the bottom esize bits of each host product
 // match the architectural result modulo 2^esize. Broadcast is Pshuflw+Pshufd
 // (halfword; Psrldq 8 first if index>=4) or Pshufd (word). Q=0 upper-64
-// discard via SetVRegFull(rd, res, q). All other by-element opcodes still
+// discard via SetVRegFull(rd, res, q). SQDMULH/SQRDMULH by element share
+// EmitSqdmulhVec with the three-same form. All other by-element opcodes still
 // bail to the lite tier — emit NOTHING before a bail.
 void HeavyOptimizerFrontend::AdvSimdVecXIndexedElement(const Decoder::AdvSimdVecXIdxArgs& args) {
   if (!success()) {
@@ -14770,6 +15159,23 @@ void HeavyOptimizerFrontend::AdvSimdVecXIndexedElement(const Decoder::AdvSimdVec
     return;
   }
 
+  // SQDMULH/SQRDMULH by element (size=01 .4h/.8h, size=10 .2s/.4s): the
+  // three-same recipe (EmitSqdmulhVec) against the broadcast of Vm.lane[index].
+  if (args.opcode == Op::kSqdmulhIdx || args.opcode == Op::kSqrdmulhIdx) {
+    const bool is_round = (args.opcode == Op::kSqrdmulhIdx);
+    if (!SqdmulhVecSupported(args.size, is_round)) {
+      UndefinedReturningVoid();
+      return;
+    }
+    FpRegister xn = AllocTempSimdReg();
+    FpRegister xm = AllocTempSimdReg();
+    builder_.GenGetSimd<16>(xn.machine_reg(), GetVRegOffset(args.rn));
+    builder_.GenGetSimd<16>(xm.machine_reg(), GetVRegOffset(args.rm));
+    EmitBroadcastVmLane(xm, args.size == 0b01, args.index);
+    SetVRegFull(args.rd, EmitSqdmulhVec(xn, xm, args.size, is_round), args.q);
+    return;
+  }
+
   if (args.opcode != Op::kMul && args.opcode != Op::kMla &&
       args.opcode != Op::kMls) {
     UndefinedReturningVoid();
@@ -14790,20 +15196,7 @@ void HeavyOptimizerFrontend::AdvSimdVecXIndexedElement(const Decoder::AdvSimdVec
   builder_.GenGetSimd<16>(xn.machine_reg(), vn_off);
   builder_.GenGetSimd<16>(xm.machine_reg(), vm_off);
 
-  // Broadcast Vm.lane[index] across every destination lane.
-  if (is_halfword) {
-    if (args.index >= 4) {
-      builder_.Gen<x86_64::PsrldqXRegImm>(xm.machine_reg(), int8_t{8});
-    }
-    const uint8_t i = args.index & 0b11;
-    const int8_t imm = static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
-    builder_.Gen<x86_64::PshuflwXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
-    builder_.Gen<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), int8_t{0x44});
-  } else {
-    const uint8_t i = args.index & 0b11;
-    const int8_t imm = static_cast<int8_t>((i << 6) | (i << 4) | (i << 2) | i);
-    builder_.Gen<x86_64::PshufdXRegXRegImm>(xm.machine_reg(), xm.machine_reg(), imm);
-  }
+  EmitBroadcastVmLane(xm, is_halfword, args.index);
 
   FpRegister result = xn;
   if (args.opcode == Op::kMul) {
@@ -15297,11 +15690,11 @@ void HeavyOptimizerFrontend::AdvSimdTableLookup(uint8_t rd, uint8_t rn, uint8_t 
 // access is the unaligned MOVDQU/MOVSD form wrapped in a recovery block so a
 // host fault reaches the guest signal handler; the 16-byte-aligned V[] slots
 // use GenGetSimd/GenSetSimd (MOVDQA). The Q=0 load uses MOVSD reg<-mem, which
-// zero-extends the upper 64 bits (D-register semantics). The interleaving
-// LD2/LD3/LD4 / ST2/ST3/ST4 de-interleave forms still bail to the lite tier
-// (their element-wise PINSR/PEXTR-from-memory has no heavy LIR op yet).
-// Mirrors lite_translator.h::AdvSimdMultiStruct (both the interleaved
-// LDn/STn de-/interleave path and the non-interleaved contiguous LD1/ST1).
+// zero-extends the upper 64 bits (D-register semantics). The interleaved
+// LD2/LD3/LD4 / ST2/ST3/ST4 move the same whole chunks and de-/interleave
+// them in XMM registers with PSHUFB (below). Same results as
+// lite_translator.h::AdvSimdMultiStruct, which moves the interleaved forms
+// element by element.
 void HeavyOptimizerFrontend::AdvSimdMultiStruct(uint8_t rt,
                                                 uint8_t rn,
                                                 uint8_t num_regs,
@@ -15317,18 +15710,17 @@ void HeavyOptimizerFrontend::AdvSimdMultiStruct(uint8_t rt,
   const int32_t vec_bytes = q ? 16 : 8;
 
   // De-interleaving LD2/LD3/LD4 / interleaving ST2/ST3/ST4 (multiple-structure
-  // form). Mirrors the lite translator's element-wise lowering: memory holds
-  // num_regs * (vec_bytes/esize) elements laid out structure-major — element e
-  // in memory belongs to register (e % num_regs), lane (e / num_regs). Because
-  // the heavy tier has NO memory-operand PINSR/PEXTR (only the register forms),
-  // each element is routed through a GP temp:
-  //   load : MOV{zx,}* mem->gp (+recovery) then PINSR gp->lane; the destination
-  //          register starts from a zeroed XMM so Q=0 zeroes the upper 64 bits.
-  //   store: PEXTR lane->gp then MOV* gp->mem (+recovery).
-  // The v[] register accesses stay full-width (GenGetSimd<16>/GenSetSimd<16>) so
-  // the optimizer's 16-byte store/load forwarding on a v[] slot is never split
-  // by a narrow sub-lane access (see the UMOV/INS-element note above); only the
-  // guest-memory side is narrow. Exact for every (num_regs, esize, Q) combo.
+  // form): memory holds num_regs * (vec_bytes/esize) elements laid out
+  // structure-major, element e in memory belonging to register (e % num_regs),
+  // lane (e / num_regs). The guest memory moves as whole 16-byte chunks
+  // (MOVDQU, or MOVSD for an 8-byte tail, each with a recovery block), and
+  // PSHUFB with the GetStructPermuteMasks masks moves the bytes between chunks
+  // and registers; POR combines the parts. A load writes no V register until
+  // every chunk is read, and a store reads every V register before it writes.
+  // The v[] register accesses stay full-width (GenGetSimd<16>/GenSetSimd<16>)
+  // so the optimizer's 16-byte store/load forwarding on a v[] slot is never
+  // split by a narrow sub-lane access (see the UMOV/INS-element note above).
+  // Exact for every (num_regs, esize, Q) combo.
   if (is_interleaved) {
     if (num_regs < 2 || num_regs > 4) {
       UndefinedReturningVoid();
@@ -15338,73 +15730,80 @@ void HeavyOptimizerFrontend::AdvSimdMultiStruct(uint8_t rt,
       UndefinedReturningVoid();
       return;
     }
-    const int esize = 1 << size;
-    const int num_lanes = vec_bytes / esize;
+    const int total_bytes = StructTotalBytes(num_regs, q);
+    const int num_chunks = (total_bytes + 15) / 16;
+    const auto& masks = GetStructPermuteMasks(is_store, num_regs, size, q);
 
     Register ibase_orig = (rn == 31) ? GetSp() : GetReg(rn);
     Register ibase = ApplyTbi(ibase_orig);
 
-    for (uint8_t r = 0; r < num_regs; r++) {
-      const uint8_t vreg = (rt + r) & 31;
-      const int32_t vt_off =
-          GetVRegOffset(vreg);
-      if (is_store) {
-        FpRegister xmm = AllocTempSimdReg();
-        builder_.GenGetSimd<16>(xmm.machine_reg(), vt_off);
-        for (int l = 0; l < num_lanes; l++) {
-          const int32_t mem_off = static_cast<int32_t>((l * num_regs + r) * esize);
-          const int8_t lane = static_cast<int8_t>(l);
-          Register elem;
-          switch (esize) {
-            case 1:
-              elem = std::get<0>(Gen<x86_64::PextrbRegXRegImm>(xmm.machine_reg(), lane));
-              Gen<x86_64::MovbOpReg>({.base = ibase, .disp = mem_off}, elem);
-              break;
-            case 2:
-              elem = std::get<0>(Gen<x86_64::PextrwRegXRegImm>(xmm.machine_reg(), lane));
-              Gen<x86_64::MovwOpReg>({.base = ibase, .disp = mem_off}, elem);
-              break;
-            case 4:
-              elem = std::get<0>(Gen<x86_64::PextrdRegXRegImm>(xmm.machine_reg(), lane));
-              Gen<x86_64::MovlOpReg>({.base = ibase, .disp = mem_off}, elem);
-              break;
-            default:  // esize == 8
-              elem = std::get<0>(Gen<x86_64::PextrqRegXRegImm>(xmm.machine_reg(), lane));
-              Gen<x86_64::MovqOpReg>({.base = ibase, .disp = mem_off}, elem);
-              break;
-          }
-          GenRecoveryBlockForLastInsn();
-        }
+    // Returns `src` permuted by mask (r, j), or nullopt when the mask moves no
+    // byte. `src` itself is kept.
+    auto permute = [&](FpRegister src, int r, int j) -> std::optional<FpRegister> {
+      const auto& mask = masks[r * kStructMaxChunks + j];
+      if (!mask.used) {
+        return std::nullopt;
+      }
+      FpRegister part = AllocTempSimdReg();
+      builder_.Gen<x86_64::MovdqaXRegXReg>(part.machine_reg(), src.machine_reg());
+      Register mask_addr = GetImm(reinterpret_cast<uint64_t>(mask.bytes));
+      FpRegister xmask{std::get<0>(Gen<x86_64::MovdqaXRegOp>({.base = mask_addr, .disp = 0}))};
+      builder_.Gen<x86_64::PshufbXRegXReg>(part.machine_reg(), xmask.machine_reg());
+      return part;
+    };
+    auto combine = [&](std::optional<FpRegister>& acc, std::optional<FpRegister> part) {
+      if (!part) {
+        return;
+      }
+      if (!acc) {
+        acc = part;
       } else {
-        FpRegister xmm = AllocZeroedSimdReg();
-        for (int l = 0; l < num_lanes; l++) {
-          const int32_t mem_off = static_cast<int32_t>((l * num_regs + r) * esize);
-          const int8_t lane = static_cast<int8_t>(l);
-          Register elem;
-          switch (esize) {
-            case 1:
-              elem = std::get<0>(Gen<x86_64::MovzxblRegOp>({.base = ibase, .disp = mem_off}));
-              GenRecoveryBlockForLastInsn();
-              builder_.Gen<x86_64::PinsrbXRegRegImm>(xmm.machine_reg(), elem, lane);
-              break;
-            case 2:
-              elem = std::get<0>(Gen<x86_64::MovzxwlRegOp>({.base = ibase, .disp = mem_off}));
-              GenRecoveryBlockForLastInsn();
-              builder_.Gen<x86_64::PinsrwXRegRegImm>(xmm.machine_reg(), elem, lane);
-              break;
-            case 4:
-              elem = std::get<0>(Gen<x86_64::MovlRegOp>({.base = ibase, .disp = mem_off}));
-              GenRecoveryBlockForLastInsn();
-              builder_.Gen<x86_64::PinsrdXRegRegImm>(xmm.machine_reg(), elem, lane);
-              break;
-            default:  // esize == 8
-              elem = std::get<0>(Gen<x86_64::MovqRegOp>({.base = ibase, .disp = mem_off}));
-              GenRecoveryBlockForLastInsn();
-              builder_.Gen<x86_64::PinsrqXRegRegImm>(xmm.machine_reg(), elem, lane);
-              break;
-          }
+        builder_.Gen<x86_64::PorXRegXReg>(acc->machine_reg(), part->machine_reg());
+      }
+    };
+
+    if (is_store) {
+      FpRegister vregs[kStructMaxRegs];
+      for (uint8_t r = 0; r < num_regs; r++) {
+        vregs[r] = AllocTempSimdReg();
+        builder_.GenGetSimd<16>(vregs[r].machine_reg(), GetVRegOffset((rt + r) & 31));
+      }
+      for (int j = 0; j < num_chunks; j++) {
+        std::optional<FpRegister> chunk;
+        for (uint8_t r = 0; r < num_regs; r++) {
+          combine(chunk, permute(vregs[r], r, j));
         }
-        builder_.GenSetSimd<16>(vt_off, xmm.machine_reg());
+        CHECK(chunk.has_value());
+        const int32_t mem_off = 16 * j;
+        if (total_bytes - mem_off >= 16) {
+          builder_.Gen<x86_64::MovdquOpXReg>({.base = ibase, .disp = mem_off},
+                                             chunk->machine_reg());
+        } else {
+          builder_.Gen<x86_64::MovsdOpXReg>({.base = ibase, .disp = mem_off},
+                                            chunk->machine_reg());
+        }
+        GenRecoveryBlockForLastInsn();
+      }
+    } else {
+      FpRegister chunks[kStructMaxChunks];
+      for (int j = 0; j < num_chunks; j++) {
+        const int32_t mem_off = 16 * j;
+        // MOVSD reg<-mem loads the 8-byte tail and zeroes the upper half.
+        chunks[j] =
+            total_bytes - mem_off >= 16
+                ? FpRegister{std::get<0>(
+                      Gen<x86_64::MovdquXRegOp>({.base = ibase, .disp = mem_off}))}
+                : FpRegister{std::get<0>(
+                      Gen<x86_64::MovsdXRegOp>({.base = ibase, .disp = mem_off}))};
+        GenRecoveryBlockForLastInsn();
+      }
+      for (uint8_t r = 0; r < num_regs; r++) {
+        std::optional<FpRegister> value;
+        for (int j = 0; j < num_chunks; j++) {
+          combine(value, permute(chunks[j], r, j));
+        }
+        CHECK(value.has_value());
+        builder_.GenSetSimd<16>(GetVRegOffset((rt + r) & 31), value->machine_reg());
       }
     }
 
@@ -15607,6 +16006,12 @@ void HeavyOptimizerFrontend::CryptoAes(uint8_t rd, uint8_t rn, uint8_t opcode) {
 // per-packet loop); bailing fragments that loop into per-instruction
 // interpreter round-trips, so lowering it keeps the region -- and the second
 // gear -- intact.
+//
+// The message-schedule updates (SHA1SU0/SU1, SHA256SU0/SU1) work on all four
+// lanes at once, so they stay in the XMM domain: the lane shifts are byte
+// shifts (PSLLDQ/PSRLDQ) or SHUFPS, the rotates are PSLLD/PSRLD pairs, and
+// no lane crosses into a GP register. Only the round functions, which are
+// serial over the lanes, take the PEXTRD/PINSRD path.
 struct HeavyOptimizerFrontend::Sha256Ops {
   HeavyOptimizerFrontend* self;
 
@@ -15614,9 +16019,6 @@ struct HeavyOptimizerFrontend::Sha256Ops {
   // register and leaves the inputs intact.
   Register Rotr(Register v, int8_t n) {
     return std::get<0>(self->Gen<x86_64::RorlRegImm>(v, n));
-  }
-  Register ShrImm(Register v, int8_t n) {
-    return std::get<0>(self->Gen<x86_64::ShrlRegImm>(v, n));
   }
   Register Xor(Register a, Register b) {
     return std::get<0>(self->Gen<x86_64::XorlRegReg>(a, b));
@@ -15629,14 +16031,45 @@ struct HeavyOptimizerFrontend::Sha256Ops {
   }
   Register BigSigma0(Register x) { return Xor(Xor(Rotr(x, 2), Rotr(x, 13)), Rotr(x, 22)); }
   Register BigSigma1(Register x) { return Xor(Xor(Rotr(x, 6), Rotr(x, 11)), Rotr(x, 25)); }
-  Register LittleSigma0(Register x) { return Xor(Xor(Rotr(x, 7), Rotr(x, 18)), ShrImm(x, 3)); }
-  Register LittleSigma1(Register x) { return Xor(Xor(Rotr(x, 17), Rotr(x, 19)), ShrImm(x, 10)); }
   Register Ch(Register e, Register f, Register g) { return Xor(g, And(e, Xor(f, g))); }
   Register Maj(Register a, Register b, Register c) { return Xor(And(a, b), And(c, Xor(a, b))); }
 
   Register Lane(FpRegister x, int8_t lane) {
     return std::get<0>(self->Gen<x86_64::PextrdRegXRegImm>(x.machine_reg(), lane));
   }
+  // Lane-parallel XMM forms; each returns a fresh register.
+  FpRegister VShl(FpRegister x, int8_t n) {
+    return FpRegister{std::get<0>(self->Gen<x86_64::PslldXRegImm>(x.machine_reg(), n))};
+  }
+  FpRegister VShr(FpRegister x, int8_t n) {
+    return FpRegister{std::get<0>(self->Gen<x86_64::PsrldXRegImm>(x.machine_reg(), n))};
+  }
+  // Whole-register shifts by `n` bytes towards lane 3 (up) or lane 0 (down).
+  FpRegister VBytesUp(FpRegister x, int8_t n) {
+    return FpRegister{std::get<0>(self->Gen<x86_64::PslldqXRegImm>(x.machine_reg(), n))};
+  }
+  FpRegister VBytesDown(FpRegister x, int8_t n) {
+    return FpRegister{std::get<0>(self->Gen<x86_64::PsrldqXRegImm>(x.machine_reg(), n))};
+  }
+  FpRegister VXor(FpRegister a, FpRegister b) {
+    return FpRegister{
+        std::get<0>(self->Gen<x86_64::PxorXRegXReg>(a.machine_reg(), b.machine_reg()))};
+  }
+  FpRegister VAdd(FpRegister a, FpRegister b) {
+    return FpRegister{
+        std::get<0>(self->Gen<x86_64::PadddXRegXReg>(a.machine_reg(), b.machine_reg()))};
+  }
+  // The two shifted halves of a rotate share no bits, so XOR joins them.
+  FpRegister VRotr(FpRegister x, int8_t n) {
+    return VXor(VShr(x, n), VShl(x, static_cast<int8_t>(32 - n)));
+  }
+  FpRegister VLittleSigma0(FpRegister x) {
+    return VXor(VXor(VRotr(x, 7), VRotr(x, 18)), VShr(x, 3));
+  }
+  FpRegister VLittleSigma1(FpRegister x) {
+    return VXor(VXor(VRotr(x, 17), VRotr(x, 19)), VShr(x, 10));
+  }
+
   FpRegister Pack(Register w0, Register w1, Register w2, Register w3) {
     FpRegister x = self->AllocTempSimdReg();
     self->builder_.Gen<x86_64::MovdXRegReg>(x.machine_reg(), w0);
@@ -15692,29 +16125,25 @@ void HeavyOptimizerFrontend::CryptoSha3Reg(uint8_t rd, uint8_t rn, uint8_t rm, u
   }
   if (opcode == 0b011) {
     // SHA1SU0: message-schedule update, part 1 —
-    //   t0 = d2^d0^m0; t1 = d3^d1^m1; t2 = n0^d2^m2; t3 = n1^d3^m3.
-    Register d0 = op.Lane(qd, 0), d1 = op.Lane(qd, 1), d2 = op.Lane(qd, 2), d3 = op.Lane(qd, 3);
-    Register n0 = op.Lane(vn, 0), n1 = op.Lane(vn, 1);
-    Register m0 = op.Lane(vm, 0), m1 = op.Lane(vm, 1), m2 = op.Lane(vm, 2), m3 = op.Lane(vm, 3);
-    Register t0 = op.Xor(op.Xor(d2, d0), m0);
-    Register t1 = op.Xor(op.Xor(d3, d1), m1);
-    Register t2 = op.Xor(op.Xor(n0, d2), m2);
-    Register t3 = op.Xor(op.Xor(n1, d3), m3);
-    SetVRegFull(rd, op.Pack(t0, t1, t2, t3), /*q=*/true);
+    //   t0 = d2^d0^m0; t1 = d3^d1^m1; t2 = n0^d2^m2; t3 = n1^d3^m3,
+    // i.e. {d2,d3,n0,n1} ^ d ^ m. SHUFPS 0x4E takes lanes 2,3 of its
+    // destination (d) and lanes 0,1 of its source (n).
+    FpRegister mid{std::get<0>(
+        Gen<x86_64::ShufpsXRegXRegImm>(qd.machine_reg(), vn.machine_reg(), int8_t{0x4E}))};
+    SetVRegFull(rd, op.VXor(op.VXor(mid, qd), vm), /*q=*/true);
     return;
   }
 
   if (opcode == 0b110) {
     // SHA256SU1: nd0 = d0 + σ1(m2) + n1; nd1 = d1 + σ1(m3) + n2;
     //            nd2 = d2 + σ1(nd0) + n3; nd3 = d3 + σ1(nd1) + m0.
-    Register d0 = op.Lane(qd, 0), d1 = op.Lane(qd, 1), d2 = op.Lane(qd, 2), d3 = op.Lane(qd, 3);
-    Register n1 = op.Lane(vn, 1), n2 = op.Lane(vn, 2), n3 = op.Lane(vn, 3);
-    Register m0 = op.Lane(vm, 0), m2 = op.Lane(vm, 2), m3 = op.Lane(vm, 3);
-    Register nd0 = op.Add(op.Add(d0, op.LittleSigma1(m2)), n1);
-    Register nd1 = op.Add(op.Add(d1, op.LittleSigma1(m3)), n2);
-    Register nd2 = op.Add(op.Add(d2, op.LittleSigma1(nd0)), n3);
-    Register nd3 = op.Add(op.Add(d3, op.LittleSigma1(nd1)), m0);
-    SetVRegFull(rd, op.Pack(nd0, nd1, nd2, nd3), /*q=*/true);
+    // With t = d + {n1,n2,n3,m0}, two half steps, using σ1(0) == 0 for the
+    // zero lanes the byte shifts bring in:
+    //   lo = t + σ1({m2,m3,0,0})    = {nd0, nd1, t2, t3};
+    //   nd = lo + σ1({0,0,nd0,nd1}) = {nd0, nd1, nd2, nd3}.
+    FpRegister t = op.VAdd(qd, op.VXor(op.VBytesDown(vn, 4), op.VBytesUp(vm, 12)));
+    FpRegister lo = op.VAdd(t, op.VLittleSigma1(op.VBytesDown(vm, 8)));
+    SetVRegFull(rd, op.VAdd(lo, op.VLittleSigma1(op.VBytesUp(lo, 8))), /*q=*/true);
     return;
   }
 
@@ -15765,23 +16194,17 @@ void HeavyOptimizerFrontend::CryptoSha2Reg(uint8_t rd, uint8_t rn, uint8_t opcod
     // SHA1SU1: message-schedule update, part 2 —
     //   t_i   = ROL(d_i ^ n_{i+1}, 1) for i = 0..2;
     //   t3    = ROL(d3 ^ t0, 1)        (t0 is the already-rotated word).
-    Register d0 = op.Lane(qd, 0), d1 = op.Lane(qd, 1), d2 = op.Lane(qd, 2), d3 = op.Lane(qd, 3);
-    Register n1 = op.Lane(vn, 1), n2 = op.Lane(vn, 2), n3 = op.Lane(vn, 3);
-    Register t0 = op.Rotr(op.Xor(d0, n1), 31);
-    Register t1 = op.Rotr(op.Xor(d1, n2), 31);
-    Register t2 = op.Rotr(op.Xor(d2, n3), 31);
-    Register t3 = op.Rotr(op.Xor(d3, t0), 31);
-    SetVRegFull(rd, op.Pack(t0, t1, t2, t3), /*q=*/true);
+    // r = ROL(d ^ {n1,n2,n3,0}, 1) gives t0..t2 and r3 = ROL(d3, 1). A rotate
+    // distributes over XOR, so t3 = r3 ^ ROL(t0, 1): move r0 up to lane 3
+    // (zeros elsewhere), rotate it, and XOR it in.
+    FpRegister r = op.VRotr(op.VXor(qd, op.VBytesDown(vn, 4)), 31);
+    SetVRegFull(rd, op.VXor(r, op.VRotr(op.VBytesUp(r, 12), 31)), /*q=*/true);
     return;
   }
-  // SHA256SU0: out_i = d_i + σ0(d_{i+1}), with d_4 taken from Vn[0].
-  Register d0 = op.Lane(qd, 0), d1 = op.Lane(qd, 1), d2 = op.Lane(qd, 2), d3 = op.Lane(qd, 3);
-  Register n0 = op.Lane(vn, 0);
-  Register o0 = op.Add(d0, op.LittleSigma0(d1));
-  Register o1 = op.Add(d1, op.LittleSigma0(d2));
-  Register o2 = op.Add(d2, op.LittleSigma0(d3));
-  Register o3 = op.Add(d3, op.LittleSigma0(n0));
-  SetVRegFull(rd, op.Pack(o0, o1, o2, o3), /*q=*/true);
+  // SHA256SU0: out_i = d_i + σ0(d_{i+1}), with d_4 taken from Vn[0]:
+  // out = d + σ0({d1,d2,d3,n0}).
+  FpRegister next = op.VXor(op.VBytesDown(qd, 4), op.VBytesUp(vn, 12));
+  SetVRegFull(rd, op.VAdd(qd, op.VLittleSigma0(next)), /*q=*/true);
 }
 
 // Compute the address for a register-offset load/store:
@@ -15790,6 +16213,11 @@ void HeavyOptimizerFrontend::CryptoSha2Reg(uint8_t rd, uint8_t rn, uint8_t opcod
 // sign-extends, LSL/UXTX/SXTX use the full 64-bit value), mirroring
 // lite_translator.h::ApplyOffsetExtend. Returns a fresh register; the base is
 // not modified (so an aliased base/dest stays correct).
+//
+// A shift of 0-3 (every access but a 128-bit Q one) folds the shift and the
+// base add into one LEA, which writes a fresh register and leaves the inputs
+// and the flags alone: `lea addr, [base + offset * (1 << shift)]` instead of
+// `mov addr, offset; shl addr, shift; add addr, base`.
 Register HeavyOptimizerFrontend::EmitRegOffsetAddr(Register base,
                                                    Register offset_reg,
                                                    uint8_t extend_type,
@@ -15805,13 +16233,29 @@ Register HeavyOptimizerFrontend::EmitRegOffsetAddr(Register base,
     case 0b011:  // LSL / UXTX: full 64-bit value, no extension.
     case 0b111:  // SXTX: full 64-bit value, sign-extend is a no-op here.
     default:
+      if (shift_amount <= 3) {
+        return EmitLeaBaseIndex(base, offset_reg, shift_amount);
+      }
       addr = Copy(offset_reg);
       break;
+  }
+  if (shift_amount <= 3) {
+    return EmitLeaBaseIndex(base, addr, shift_amount);
   }
   if (shift_amount != 0) {
     addr = std::get<0>(Gen<x86_64::ShlqRegImm, kNoSSA>(addr, static_cast<int8_t>(shift_amount)));
   }
   return std::get<0>(Gen<x86_64::AddqRegReg, kNoSSA>(addr, base));
+}
+
+Register HeavyOptimizerFrontend::EmitLeaBaseIndex(Register base,
+                                                  Register index,
+                                                  uint8_t shift_amount) {
+  CHECK_LE(shift_amount, 3);
+  return std::get<0>(Gen<x86_64::LeaqRegOp>(x86_64::MemoryOperand{
+      .base = base,
+      .index = index,
+      .scale = static_cast<x86_64::Assembler::ScaleFactor>(shift_amount)}));
 }
 
 // Emit `src` shifted by a constant amount (LSL/LSR/ASR/ROR) into a fresh
