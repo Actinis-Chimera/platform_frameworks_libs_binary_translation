@@ -16,9 +16,6 @@
 
 #include <pthread.h>
 #include <sys/types.h>  // pid_t
-#if defined(DRION_ENABLE_NATIVE_BRIDGE_GUEST_CRASH_DIAGNOSTICS)
-#include <atomic>
-#endif
 #include <cstddef>      // size_t
 
 #include "berberis/base/checks.h"
@@ -40,10 +37,6 @@ namespace {
 
 GuestThreadExitListenerFn g_guest_thread_exit_listener = nullptr;
 
-#if defined(DRION_ENABLE_NATIVE_BRIDGE_GUEST_CRASH_DIAGNOSTICS)
-std::atomic<bool> g_guest_thread_key_ready{false};
-#endif
-
 void GuestThreadDtor(void* /* arg */) {
   // TLS cache was cleared by pthread_exit.
   // TODO(b/280671643): Postpone detach to last pthread destructor iteration.
@@ -64,19 +57,7 @@ GuestThreadExitListenerFn RegisterGuestThreadExitListener(GuestThreadExitListene
 void InitGuestThreadManager() {
   // Here we don't need pthread_once, which is not reentrant due to spinlocks.
   CHECK_EQ(0, pthread_key_create(&g_guest_thread_key, GuestThreadDtor));
-#if defined(DRION_ENABLE_NATIVE_BRIDGE_GUEST_CRASH_DIAGNOSTICS)
-  g_guest_thread_key_ready.store(true, std::memory_order_release);
-#endif
 }
-
-#if defined(DRION_ENABLE_NATIVE_BRIDGE_GUEST_CRASH_DIAGNOSTICS)
-GuestThread* DrionPeekAttachedGuestThreadForDiagnostic() {
-  if (!g_guest_thread_key_ready.load(std::memory_order_acquire)) {
-    return nullptr;
-  }
-  return static_cast<GuestThread*>(pthread_getspecific(g_guest_thread_key));
-}
-#endif
 
 GuestThread* GetCurrentGuestThread() {
   bool attached;

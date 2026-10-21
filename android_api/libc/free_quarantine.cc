@@ -44,9 +44,6 @@
 #endif
 
 extern "C" void __real_free(void* ptr);
-#if defined(BERBERIS_ENABLE_GUEST_FREE_DIAGNOSTICS)
-bool TraceGuestQuarantineInput(void* ptr);
-#endif
 
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
 namespace {
@@ -75,9 +72,6 @@ extern "C" void __wrap_free(void* ptr) {
   // its Scudo region) stays live long enough that the translator's Arena cannot
   // re-grab and clobber it under a benign guest use-after-free. Release whatever
   // pointer the ring evicts.
-#if defined(BERBERIS_ENABLE_GUEST_FREE_DIAGNOSTICS)
-  if (TraceGuestQuarantineInput(ptr)) return;
-#endif
   void* evicted = QuarantineSwap(ptr);
   if (evicted != nullptr) {
     __real_free(evicted);
