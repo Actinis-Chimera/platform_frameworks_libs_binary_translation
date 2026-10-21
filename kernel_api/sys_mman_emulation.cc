@@ -183,6 +183,18 @@ void* MmapForGuest(void* addr, size_t length, int prot, int flags, int fd, off64
 }
 
 int MunmapForGuest(void* addr, size_t length) {
+  // region digitalis
+  // Guests that scan "/proc/self/maps" also munmap mappings protected from
+  // them (see MprotectForGuest). Keep those mappings and their executable bits
+  // intact: clearing the bits even briefly lets another thread cache a NoExec
+  // handler for valid libc code and fault on it. Report success so guest
+  // cleanup code does not treat the kept mapping as a fatal failure.
+  if (GuestMapShadow::GetInstance()->IntersectsWithProtectedMapping(
+          addr, static_cast<char*>(addr) + length)) {
+    TRACE("Suppressing guest munmap(%p, %zu) on a mapping protected from guest", addr, length);
+    return 0;
+  }
+  // endregion
   GuestMapShadow::GetInstance()->ClearExecutable(ToGuestAddr(addr), length);
   return munmap(addr, length);
 }
