@@ -250,6 +250,7 @@ cc_test_library {
     name: "libberberis_guest_os_primitives_arm64_unit_tests",
     defaults: ["berberis_test_library_defaults_64"],
     srcs: [
+        "arm64/guest_map_shadow_exec_transition_test.cc",
         "arm64/guest_signal_action_dual_abi_test.cc",
         "arm64/ucontext_layout_test.cc",
     ],
@@ -271,6 +272,7 @@ cc_test_library {
         "libberberis_guest_os_primitives_arm64_headers",
         "libberberis_guest_state_headers",
         "libberberis_guest_state_arm64_headers",
+        "libberberis_runtime_primitives_headers",
     ],
 }
 // endregion

@@ -190,10 +190,31 @@ void GuestMapShadow::SetExecutable(GuestAddr start, size_t size) {
   // endregion
   GuestAddr end = AlignUpGuestPageSize(start + size);
   GuestAddr pc = AlignDownGuestPageSize(start);
+  // region digitalis
+  // A thread that reached a page while it was not executable left a NoExec
+  // handler cached for its PC, and that handler would keep raising SIGSEGV
+  // after the page became executable again (a guest that patches its own text
+  // between mprotect(PROT_READ|PROT_WRITE) and mprotect(PROT_READ|PROT_EXEC)).
+  // Drop the cached entries of each run of pages that turns executable here;
+  // pages that were already executable keep their translations and wrapped
+  // host functions.
+  GuestAddr flipped_start = kNullGuestAddr;
+  bool in_flipped_run = false;
   while (pc < end) {
-    SetExecAddr(pc, 1);
+    bool flipped = SetExecAddr(pc, 1);
+    if (flipped && !in_flipped_run) {
+      flipped_start = pc;
+      in_flipped_run = true;
+    } else if (!flipped && in_flipped_run) {
+      InvalidateGuestRange(flipped_start, pc);
+      in_flipped_run = false;
+    }
     pc += kGuestPageSize;
   }
+  if (in_flipped_run) {
+    InvalidateGuestRange(flipped_start, end);
+  }
+  // endregion
 }
 
 void GuestMapShadow::ClearExecutable(GuestAddr start, size_t size) {
