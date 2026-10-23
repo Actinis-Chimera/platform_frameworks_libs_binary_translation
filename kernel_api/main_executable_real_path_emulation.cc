@@ -16,6 +16,9 @@
 
 #include "berberis/kernel_api/main_executable_real_path_emulation.h"
 
+// region digitalis
+#include <fcntl.h>
+// endregion
 #include <sys/stat.h>
 
 #include "berberis/base/config_globals.h"
@@ -23,7 +26,7 @@
 
 namespace berberis {
 
-const char* TryReadLinkToMainExecutableRealPath(const char* pathname) {
+const char* TryReadLinkToMainExecutableRealPath(int dirfd, const char* pathname) {
   ScopedErrno scoped_errno;
 
   // /proc/self/exe and /proc/<pid>/exe are the same file, as /proc/self is a link to /proc/<pid>!
@@ -33,7 +36,12 @@ const char* TryReadLinkToMainExecutableRealPath(const char* pathname) {
   // Do not cache /proc/self/exe lstat to handle situations after fork/clone!
   struct stat cur_stat;
   struct stat exe_stat;
-  if (lstat(pathname, &cur_stat) == 0 && lstat("/proc/self/exe", &exe_stat) == 0 &&
+  // region digitalis
+  // A relative `pathname` is looked up relative to `dirfd` (like the openat it is part of), not
+  // relative to the current directory, so that openat(selffd, "exe") is recognised as well.
+  const bool found_path = fstatat(dirfd, pathname, &cur_stat, AT_SYMLINK_NOFOLLOW) == 0;
+  // endregion
+  if (found_path && lstat("/proc/self/exe", &exe_stat) == 0 &&
       cur_stat.st_ino == exe_stat.st_ino && cur_stat.st_dev == exe_stat.st_dev) {
     return berberis::GetMainExecutableRealPath();
   }

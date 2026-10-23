@@ -26,6 +26,8 @@
 #include <sys/types.h>
 
 // region digitalis
+#include <stddef.h>
+
 #include <string>
 // endregion
 
@@ -36,6 +38,16 @@ int ToGuestOpenFlags(int host_flags);
 
 int OpenatForGuest(int dirfd, const char* pathname, int flags, mode_t mode);
 int OpenForGuest(const char* pathname, int flags, mode_t mode);
+
+// region digitalis
+// Guest openat2(2). `how` points to the guest's struct open_how (flags, mode and
+// resolve, 24 bytes, extensible by size) and `size` is the guest-supplied size
+// of that struct. The guest sees the same emulated /proc/self/maps and
+// /proc/cpuinfo that OpenatForGuest serves, by any path that names them. Every
+// other open goes to the host openat2 with the open flags translated to the
+// host values. Returns -1 and sets errno on failure, like OpenatForGuest.
+int Openat2ForGuest(int dirfd, const char* pathname, const void* how, size_t size);
+// endregion
 
 bool IsFileDescriptorEmulatedProcSelfMaps(int fd);
 void CloseEmulatedProcSelfMapsFileDescriptor(int fd);

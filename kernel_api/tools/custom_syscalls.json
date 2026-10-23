@@ -173,6 +173,9 @@
   "__NR_openat": {
     "custom_reason": "follows symlinks, open flags value mismatch"
   },
+  "__NR_openat2": {
+    "custom_reason": "follows symlinks, open flags value mismatch"
+  },
   "__NR_prctl": {
     "custom_reason": "custom syscall"
   },

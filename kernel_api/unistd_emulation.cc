@@ -26,7 +26,7 @@
 namespace berberis {
 
 ssize_t ReadLinkAtForGuest(int dirfd, const char* path, char* buf, size_t buf_size) {
-  const char* real_path = TryReadLinkToMainExecutableRealPath(path);
+  const char* real_path = TryReadLinkToMainExecutableRealPath(dirfd, path);
   if (!real_path) {
     return readlinkat(dirfd, path, buf, buf_size);
   }

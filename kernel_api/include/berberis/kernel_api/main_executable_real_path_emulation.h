@@ -19,7 +19,9 @@
 
 namespace berberis {
 
-const char* TryReadLinkToMainExecutableRealPath(const char* pathname);
+// Returns the real path of the main executable if `pathname`, looked up relative to `dirfd` when
+// it is relative, names /proc/self/exe, otherwise nullptr.
+const char* TryReadLinkToMainExecutableRealPath(int dirfd, const char* pathname);
 
 }  // namespace berberis
 

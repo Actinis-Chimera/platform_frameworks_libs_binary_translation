@@ -180,6 +180,7 @@ cc_test_library {
         "arm64/futex_eintr_test.cc",
         "arm64/mmap_bss_zero_test.cc",
         "arm64/munmap_protected_mapping_test.cc",
+        "arm64/open_proc_self_relative_test.cc",
         "arm64/seccomp_neuter_test.cc",
     ],
     header_libs: [

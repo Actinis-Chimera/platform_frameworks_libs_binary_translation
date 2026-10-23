@@ -63,7 +63,7 @@ constexpr long kGuestNrSeccomp = 277;        // asm-generic __NR_seccomp
 int FstatatForGuest(int dirfd, const char* path, struct stat* buf, int flags) {
   const char* real_path = nullptr;
   if ((flags & AT_SYMLINK_NOFOLLOW) == 0) {
-    real_path = TryReadLinkToMainExecutableRealPath(path);
+    real_path = TryReadLinkToMainExecutableRealPath(dirfd, path);
   }
   return syscall(__NR_newfstatat, dirfd, real_path ? real_path : path, buf, flags);
 }

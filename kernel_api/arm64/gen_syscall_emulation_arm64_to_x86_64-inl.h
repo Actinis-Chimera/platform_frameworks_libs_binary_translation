@@ -430,7 +430,8 @@ long RunGuestSyscallImpl(long guest_nr,
       // follows symlinks, open flags value mismatch
       return RunGuestSyscall___NR_openat(arg_1, arg_2, arg_3, arg_4);
     case 437:  // __NR_openat2
-      return syscall(437, arg_1, arg_2, arg_3, arg_4);
+      // follows symlinks, open flags value mismatch
+      return RunGuestSyscall___NR_openat2(arg_1, arg_2, arg_3, arg_4);
     case 241:  // __NR_perf_event_open
       return syscall(298, arg_1, arg_2, arg_3, arg_4, arg_5);
     case 92:  // __NR_personality

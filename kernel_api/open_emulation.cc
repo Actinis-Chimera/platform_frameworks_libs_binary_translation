@@ -16,8 +16,14 @@
 
 #include "berberis/kernel_api/open_emulation.h"
 
+// region digitalis
+#include <errno.h>
+// endregion
 #include <fcntl.h>
 #include <sys/stat.h>
+// region digitalis
+#include <sys/syscall.h>
+// endregion
 #include <unistd.h>
 
 #include <cstdint>
@@ -231,14 +237,32 @@ int OpenatProcSelfMapsForGuest(int dirfd, int flags, mode_t mode) {
   return mem_fd;
 }
 
-bool IsProcSelfMaps(const char* path, int flags) {
+// region digitalis
+// Whether `st` is the identity of the file at `reference_path` (same device and inode).
+bool IsSameFileAs(const struct stat& st, const char* reference_path) {
+  struct stat reference_stat;
+  return stat(reference_path, &reference_stat) == 0 && st.st_ino == reference_stat.st_ino &&
+         st.st_dev == reference_stat.st_dev;
+}
+
+bool IsProcSelfMapsStat(const struct stat& st) {
+  return IsSameFileAs(st, PROC_SELF_MAPS);
+}
+// endregion
+
+bool IsProcSelfMaps(int dirfd, const char* path, int flags) {
   struct stat cur_stat;
-  struct stat proc_stat;
   // This check works for /proc/self/maps itself as well as symlinks (unless AT_SYMLINK_NOFOLLOW is
   // requested). As an added benefit it gracefully handles invalid pointers in path.
-  return stat(path, &cur_stat) == 0 && stat(PROC_SELF_MAPS, &proc_stat) == 0 &&
+  // region digitalis
+  // `path` is looked up relative to `dirfd`, like the openat it is part of. A relative path (for
+  // example "maps" or "./maps" under an open /proc/self, or "self/maps" under /proc) must not be
+  // resolved against the current directory: it would then miss the emulated view and the guest
+  // would read the raw host file.
+  // endregion
+  return fstatat(dirfd, path, &cur_stat, 0) == 0 &&
          !(S_ISLNK(cur_stat.st_mode) && (flags & AT_SYMLINK_NOFOLLOW)) &&
-         cur_stat.st_ino == proc_stat.st_ino && cur_stat.st_dev == proc_stat.st_dev;
+         IsProcSelfMapsStat(cur_stat);
 }
 
 // In zygote this is not needed because native bridge is mounting
@@ -248,12 +272,31 @@ bool IsProcSelfMaps(const char* path, int flags) {
 // Note that current selinux policies prevent us from mounting /proc/cpuinfo
 // (replicating what zygote process does) for executables hence we need to
 // emulate it here.
-const char* TryTranslateProcCpuinfoPath(const char* path, int flags) {
-#if defined(__ANDROID__)
-  struct stat cur_stat;
-  struct stat cpuinfo_stat;
+// region digitalis
+// The arm64 guest must see its own cpuinfo on every host libc, not only on
+// Android, so the host unit tests can check what OpenatForGuest serves.
+#if defined(__ANDROID__) || defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+#define BERBERIS_EMULATES_PROC_CPUINFO 1
+#endif
 
-  if (stat(path, &cur_stat) == -1 || stat("/proc/cpuinfo", &cpuinfo_stat) == -1) {
+// Whether `st` is /proc/cpuinfo, which the guest sees as its own cpuinfo.
+bool IsProcCpuinfoStat([[maybe_unused]] const struct stat& st) {
+#ifdef BERBERIS_EMULATES_PROC_CPUINFO
+  return IsSameFileAs(st, "/proc/cpuinfo");
+#else
+  return false;
+#endif
+}
+// endregion
+
+const char* TryTranslateProcCpuinfoPath(int dirfd, const char* path, int flags) {
+#ifdef BERBERIS_EMULATES_PROC_CPUINFO
+  struct stat cur_stat;
+
+  // region digitalis
+  // Looked up relative to dirfd, see IsProcSelfMaps.
+  // endregion
+  if (fstatat(dirfd, path, &cur_stat, 0) == -1) {
     return nullptr;
   }
 
@@ -261,12 +304,12 @@ const char* TryTranslateProcCpuinfoPath(const char* path, int flags) {
     return nullptr;
   }
 
-  if ((cur_stat.st_ino == cpuinfo_stat.st_ino) && (cur_stat.st_dev == cpuinfo_stat.st_dev)) {
+  if (IsProcCpuinfoStat(cur_stat)) {
     TRACE("openat: Translating %s to %s", path, kGuestCpuinfoPath);
     return kGuestCpuinfoPath;
   }
 #else
-  UNUSED(path, flags);
+  UNUSED(dirfd, path, flags);
 #endif
   return nullptr;
 }
@@ -380,17 +423,17 @@ const char* TryRedirectGuestLinker64(const char* path) {
 int OpenatForGuest(int dirfd, const char* path, int guest_flags, mode_t mode) {
   int host_flags = ToHostOpenFlags(guest_flags);
 
-  if (IsProcSelfMaps(path, host_flags)) {
+  if (IsProcSelfMaps(dirfd, path, host_flags)) {
     return OpenatProcSelfMapsForGuest(dirfd, host_flags, mode);
   }
 
   const char* real_path = nullptr;
   if ((host_flags & AT_SYMLINK_NOFOLLOW) == 0) {
-    real_path = TryReadLinkToMainExecutableRealPath(path);
+    real_path = TryReadLinkToMainExecutableRealPath(dirfd, path);
   }
 
   if (real_path == nullptr) {
-    real_path = TryTranslateProcCpuinfoPath(path, host_flags);
+    real_path = TryTranslateProcCpuinfoPath(dirfd, path, host_flags);
   }
 
   // region digitalis
@@ -419,5 +462,131 @@ int OpenatForGuest(int dirfd, const char* path, int guest_flags, mode_t mode) {
 int OpenForGuest(const char* path, int flags, mode_t mode) {
   return OpenatForGuest(AT_FDCWD, path, flags, mode);
 }
+
+// region digitalis
+namespace {
+
+#ifndef __NR_openat2
+#define __NR_openat2 437
+#endif
+
+// struct open_how at its first version (OPEN_HOW_SIZE_VER0, still the latest). The layout does not
+// depend on the architecture, so the guest's struct can be read, and the host's built, with it.
+struct OpenHow {
+  uint64_t flags;
+  uint64_t mode;
+  uint64_t resolve;
+};
+constexpr size_t kOpenHowSizeVer0 = sizeof(OpenHow);
+static_assert(kOpenHowSizeVer0 == 24);
+// The kernel does not limit the size of a larger struct; a guest passing more than a page is
+// either broken or probing, and its tail cannot be vouched for. Refuse it the way the kernel
+// refuses a struct with unknown fields set.
+constexpr size_t kOpenHowMaxSize = 4096;
+// RESOLVE_NO_XDEV | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_BENEATH |
+// RESOLVE_IN_ROOT | RESOLVE_CACHED.
+constexpr uint64_t kValidResolveMask = 0x3f;
+// The host's __O_TMPFILE; O_TMPFILE is this together with O_DIRECTORY.
+constexpr int kHostOTmpfileBit = 020000000;
+constexpr uint64_t kModeMask = 07777;
+
+// Resolves `path` under `dirfd` with the guest's resolve restrictions, the way the host kernel
+// would for the open itself, without opening it, and stores what it names in `*resolved`. Returns
+// false, with the kernel's errno, if the kernel refuses. The open flags that change what the path
+// names are carried over (O_NOFOLLOW keeps a final symlink as the symlink).
+bool ResolveForOpenat2(
+    int dirfd, const char* path, int host_flags, uint64_t resolve, struct stat* resolved) {
+  OpenHow probe = {
+      static_cast<uint64_t>(O_PATH | O_CLOEXEC | (host_flags & O_NOFOLLOW)), 0, resolve};
+  int fd = static_cast<int>(syscall(__NR_openat2, dirfd, path, &probe, sizeof(probe)));
+  if (fd < 0) {
+    return false;
+  }
+  int result = fstat(fd, resolved);
+  int saved_errno = errno;
+  close(fd);
+  errno = saved_errno;
+  return result == 0;
+}
+
+}  // namespace
+
+int Openat2ForGuest(int dirfd, const char* path, const void* how_ptr, size_t size) {
+  // Check the struct in the order the kernel does, so that a guest probing for the syscall's
+  // error contract gets the same answers as on a real device.
+  if (size < kOpenHowSizeVer0) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (size > kOpenHowMaxSize) {
+    errno = E2BIG;
+    return -1;
+  }
+  if (how_ptr == nullptr) {
+    errno = EFAULT;
+    return -1;
+  }
+  const auto* bytes = static_cast<const unsigned char*>(how_ptr);
+  OpenHow how;
+  memcpy(&how, bytes, sizeof(how));
+  for (size_t i = sizeof(how); i < size; ++i) {
+    if (bytes[i] != 0) {
+      errno = E2BIG;
+      return -1;
+    }
+  }
+  if (how.flags > UINT32_MAX || (how.resolve & ~kValidResolveMask) != 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  const int host_flags = ToHostOpenFlags(static_cast<int>(static_cast<uint32_t>(how.flags)));
+  const bool creates = (host_flags & (O_CREAT | kHostOTmpfileBit)) != 0;
+  if (creates ? (how.mode & ~kModeMask) != 0 : how.mode != 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  const mode_t mode = static_cast<mode_t>(how.mode);
+
+  // Same emulated views as OpenatForGuest. Only O_CLOEXEC of the open flags applies to them.
+  //
+  // The resolve restrictions decide what the path names, or whether it names anything: on a real
+  // device RESOLVE_NO_SYMLINKS fails on "/proc/self/maps" (ELOOP), RESOLVE_BENEATH fails on an
+  // absolute path (EXDEV) and RESOLVE_IN_ROOT looks it up under dirfd. So when the guest asks for
+  // any, the host kernel resolves the path under those restrictions first (see ResolveForOpenat2)
+  // and the view is served only if that is the file the view stands for. A path the kernel refuses
+  // gets its error, and no view. Without restrictions the lookup that OpenatForGuest does decides.
+  bool serve_maps = false;
+  bool serve_cpuinfo = false;
+  if (how.resolve == 0) {
+    serve_maps = IsProcSelfMaps(dirfd, path, host_flags);
+    serve_cpuinfo = !serve_maps && TryTranslateProcCpuinfoPath(dirfd, path, host_flags) != nullptr;
+  } else {
+    struct stat resolved;
+    if (ResolveForOpenat2(dirfd, path, host_flags, how.resolve, &resolved)) {
+      serve_maps = IsProcSelfMapsStat(resolved);
+      serve_cpuinfo = !serve_maps && IsProcCpuinfoStat(resolved);
+    } else if (!creates) {
+      return -1;
+    }
+    // A creating open may name a file that does not exist yet, which the resolution cannot find.
+    // Nothing is served for it, and the host openat2 below gives the kernel's answer.
+  }
+  if (serve_maps) {
+    return OpenatProcSelfMapsForGuest(dirfd, host_flags, mode);
+  }
+  if (serve_cpuinfo) {
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+    return OpenatProcCpuinfoForGuest(dirfd, host_flags, mode);
+#else
+    return static_cast<int>(openat(AT_FDCWD, kGuestCpuinfoPath, host_flags, mode));
+#endif
+  }
+
+  // Anything else is the host's to open, with the guest's open flags in the host's encoding.
+  OpenHow host_how = {static_cast<uint64_t>(static_cast<uint32_t>(host_flags)), how.mode,
+                      how.resolve};
+  return static_cast<int>(syscall(__NR_openat2, dirfd, path, &host_how, sizeof(host_how)));
+}
+// endregion
 
 }  // namespace berberis

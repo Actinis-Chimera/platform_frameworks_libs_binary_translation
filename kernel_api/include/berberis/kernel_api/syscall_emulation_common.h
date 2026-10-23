@@ -259,6 +259,21 @@ inline long RunGuestSyscall___NR_openat(long arg_1, long arg_2, long arg_3, long
 #endif
 }
 
+// region digitalis
+inline long RunGuestSyscall___NR_openat2(long arg_1, long arg_2, long arg_3, long arg_4) {
+  // Like __NR_openat, the emulation is not enabled on arm64 hosts yet: keep passing the guest's
+  // request straight to the host there.
+#ifdef __aarch64__
+  return syscall(437, arg_1, arg_2, arg_3, arg_4);
+#else
+  return static_cast<long>(Openat2ForGuest(static_cast<int>(arg_1),       // dirfd
+                                            bit_cast<const char*>(arg_2),  // path
+                                            bit_cast<const void*>(arg_3),  // struct open_how*
+                                            bit_cast<size_t>(arg_4)));     // sizeof(open_how)
+#endif
+}
+// endregion
+
 inline long RunGuestSyscall___NR_prctl(long arg_1, long arg_2, long arg_3, long arg_4, long arg_5) {
   // TODO(b/346604197): Enable on arm64 once guest_os_primitives is ported.
 #ifdef __aarch64__
