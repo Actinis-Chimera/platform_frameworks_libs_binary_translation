@@ -63,6 +63,15 @@ extern const char* kGuestCpuinfoPath;
 // kGuestCpuinfoPath file, so the reported core count tracks the real device.
 std::string FormatGuestCpuinfo(int num_cpus);
 #endif
+
+// The guest's own copy of a host system library. For `path` naming a library
+// directly in /system/lib64 or /apex/com.android.runtime/lib64/bionic, which
+// hold the host's x86_64 libraries on the host image, returns the file of the
+// same name in `guest_library_dir` if it is a regular file there. Returns an
+// empty string for every other path. Defined for the arm64 guest only, whose
+// OpenatForGuest opens the returned path instead, with /system/lib64/arm64 as
+// `guest_library_dir`.
+std::string GuestSystemLibraryPathFor(const char* path, const char* guest_library_dir);
 // endregion digitalis
 
 }  // namespace berberis

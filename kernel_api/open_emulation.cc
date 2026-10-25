@@ -32,11 +32,15 @@
 #include <mutex>
 // region digitalis
 #include <string>
+#include <string_view>
 // endregion
 #include <utility>
 
 #include "berberis/base/arena_alloc.h"
 #include "berberis/base/arena_map.h"
+// region digitalis
+#include "berberis/base/arena_set.h"
+// endregion
 #include "berberis/base/arena_string.h"
 #include "berberis/base/arena_vector.h"
 #include "berberis/base/checks.h"
@@ -127,6 +131,99 @@ ArenaVector<String> SplitLines(Arena* arena, const String& content) {
   return lines;
 }
 
+// region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+// A mapped file, by the device and inode /proc/self/maps prints for it.
+using MappedFileId = std::pair<uint64_t, uint64_t>;
+
+// Reads the range, the host "x" bit and the file of a maps line. Returns false
+// for a line that does not parse or maps no file (inode 0: anonymous memory,
+// the stack, the vdso).
+bool ParseMappedFileLine(const char* line,
+                         uintptr_t* start,
+                         uintptr_t* end,
+                         bool* host_exec,
+                         MappedFileId* file) {
+  char perms[5];
+  uint64_t offset;
+  unsigned dev_major;
+  unsigned dev_minor;
+  uint64_t inode;
+  if (sscanf(line,
+             "%" SCNxPTR "-%" SCNxPTR " %4s %" SCNx64 " %x:%x %" SCNu64,
+             start,
+             end,
+             perms,
+             &offset,
+             &dev_major,
+             &dev_minor,
+             &inode) != 7 ||
+      inode == 0) {
+    return false;
+  }
+  *host_exec = perms[2] == 'x';
+  *file = MappedFileId((uint64_t{dev_major} << 32) | dev_minor, inode);
+  return true;
+}
+
+bool HasGuestExecutablePart(GuestMapShadow* maps_shadow, uintptr_t start, uintptr_t end) {
+  while (start < end) {
+    auto [is_exec, region_size] =
+        maps_shadow->GetExecutableRegionSize(GuestAddr(start), end - start);
+    if (is_exec) {
+      return true;
+    }
+    start += region_size;
+  }
+  return false;
+}
+
+// Host images: files the host has mapped with host code that the guest has not
+// mapped as guest code, i.e. the x86_64 libraries and executables of the host
+// side of the process. An arm64 device has none, and their in-memory headers
+// are the host loader's: glibc relocates the d_ptr entries of a library's
+// .dynamic in place, bionic does not. A guest integrity check that walks the
+// maps for a system library (the host one carries an Android name), parses its
+// dynamic section and adds the load bias again faults on a non-canonical
+// address. A guest maps its own code without host "x" (the translator runs
+// it), so a host "x" line is host code; a file that also holds guest code, as
+// a guest JIT's double mapping can, stays the guest's.
+template <typename Lines>
+ArenaSet<MappedFileId> FindHostImages(Arena* arena, const Lines& lines, GuestMapShadow* maps_shadow) {
+  ArenaSet<MappedFileId> host_code(arena);
+  ArenaSet<MappedFileId> guest_code(arena);
+  for (const auto& line : lines) {
+    uintptr_t start;
+    uintptr_t end;
+    bool host_exec;
+    MappedFileId file;
+    if (!ParseMappedFileLine(line.c_str(), &start, &end, &host_exec, &file)) {
+      continue;
+    }
+    if (HasGuestExecutablePart(maps_shadow, start, end)) {
+      guest_code.insert(file);
+    } else if (host_exec) {
+      host_code.insert(file);
+    }
+  }
+  for (const auto& file : guest_code) {
+    host_code.erase(file);
+  }
+  return host_code;
+}
+
+template <typename String>
+bool IsHostImageLine(const String& line, const ArenaSet<MappedFileId>& host_images) {
+  uintptr_t start;
+  uintptr_t end;
+  bool host_exec;
+  MappedFileId file;
+  return ParseMappedFileLine(line.c_str(), &start, &end, &host_exec, &file) &&
+         host_images.count(file) != 0;
+}
+#endif
+// endregion
+
 // Note that dirfd, flags and mode are only used to fallback to
 // host's openat in case of failure.
 // Avoid mallocs since bionic tests use it under malloc_disable (b/338211718).
@@ -146,6 +243,11 @@ int OpenatProcSelfMapsForGuest(int dirfd, int flags, mode_t mode) {
   auto* maps_shadow = GuestMapShadow::GetInstance();
 
   auto lines = SplitLines(&arena, file_data);
+  // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  const auto host_images = FindHostImages(&arena, lines, maps_shadow);
+#endif
+  // endregion
   ArenaString guest_maps(&arena);
   for (size_t i = 0; i < lines.size(); i++) {
     uintptr_t start;
@@ -175,6 +277,10 @@ int OpenatProcSelfMapsForGuest(int dirfd, int flags, mode_t mode) {
     // crashes (the MSA OAID SDK's soinfo-list anti-tamper walk did exactly this).
     // Rewrite the guest linker's path to the canonical location apps expect, and
     // drop the host linker's lines so introspection can't latch onto it.
+    // Every other host image is dropped as well (FindHostImages).
+    if (IsHostImageLine(cur_line, host_images)) {
+      continue;
+    }
     {
       static constexpr char kGuestArm64LinkerPath[] = "/system/bin/arm64/linker64";
       static constexpr char kCanonicalLinkerPath[] = "/apex/com.android.runtime/bin/linker64";
@@ -182,7 +288,9 @@ int OpenatProcSelfMapsForGuest(int dirfd, int flags, mode_t mode) {
       if (gpos != ArenaString::npos) {
         cur_line.replace(gpos, sizeof(kGuestArm64LinkerPath) - 1, kCanonicalLinkerPath);
       } else if (cur_line.find(kCanonicalLinkerPath) != ArenaString::npos) {
-        // Host x86_64 linker — hide it from the guest's view.
+        // Host x86_64 linker — hide it from the guest's view. FindHostImages
+        // already drops it as a host image; this keeps the name check for a
+        // linker mapped without host code.
         continue;
       }
     }
@@ -417,6 +525,45 @@ const char* TryRedirectGuestLinker64(const char* path) {
   TRACE("openat: redirecting guest linker \"%s\" to %s", path, kGuestLinker64RealPath);
   return kGuestLinker64RealPath;
 }
+
+inline constexpr char kGuestSystemLibraryDir[] = "/system/lib64/arm64";
+
+// On the x86_64 host image /system/lib64 holds the host's libraries, and the
+// runtime APEX's bionic directory links to them; the guest's arm64 copies are
+// in /system/lib64/arm64. The guest linker searches that directory, but a guest
+// that loads a library itself (a hardening loader that decrypts and maps an
+// app library, then resolves its DT_NEEDED entries by opening each one at its
+// canonical device path and reading its ELF header) would read an x86_64 ELF
+// and give up on the library. Such a guest opens the arm64 copy instead, as it
+// would on a device. A host library without an arm64 copy keeps its path.
+std::string GuestSystemLibraryPathFor(const char* path, const char* guest_library_dir) {
+  if (path == nullptr || guest_library_dir == nullptr) {
+    return {};
+  }
+  static constexpr std::string_view kHostLibraryDirs[] = {
+      "/system/lib64/",
+      "/apex/com.android.runtime/lib64/bionic/",
+  };
+  const std::string_view requested(path);
+  for (const auto dir : kHostLibraryDirs) {
+    if (!requested.starts_with(dir)) {
+      continue;
+    }
+    const auto name = requested.substr(dir.size());
+    if (name.empty() || name == "." || name == ".." || name.find('/') != std::string_view::npos) {
+      return {};
+    }
+    std::string guest_path(guest_library_dir);
+    guest_path += '/';
+    guest_path += name;
+    struct stat guest_stat;
+    if (stat(guest_path.c_str(), &guest_stat) != 0 || !S_ISREG(guest_stat.st_mode)) {
+      return {};
+    }
+    return guest_path;
+  }
+  return {};
+}
 #endif  // NATIVE_BRIDGE_GUEST_ARCH_ARM64
 // endregion
 
@@ -443,6 +590,16 @@ int OpenatForGuest(int dirfd, const char* path, int guest_flags, mode_t mode) {
   }
   if (real_path == nullptr) {
     real_path = TryRedirectGuestLinker64(path);
+  }
+  std::string guest_library_path;
+  if (real_path == nullptr) {
+    guest_library_path = GuestSystemLibraryPathFor(path, kGuestSystemLibraryDir);
+    if (!guest_library_path.empty()) {
+      TRACE("openat: opening the guest copy %s of host library \"%s\"",
+            guest_library_path.c_str(),
+            path);
+      real_path = guest_library_path.c_str();
+    }
   }
 #endif
 
