@@ -19,6 +19,12 @@
 
 #include <utility>
 // region digitalis
+// Proxy-argument diagnostics: a BERBERIS_PROXY_ARG_DIAGNOSTICS build (Drion's
+// DRION_NATIVE_BRIDGE_DIAGNOSTICS=1 build, debuggable only) logs a pointer-typed
+// first argument whose raw value is below 0x10000, and a re-extracted first
+// argument that differs from x0. Default builds compile none of it: a small
+// non-null pointer argument is often a handle or a sentinel, and an app passing
+// one every frame flooded logcat from the proxy hot path (#956).
 #include <dlfcn.h>
 #include <type_traits>
 #include "berberis/base/tracing.h"
@@ -111,7 +117,7 @@ class TrampolineFuncGenerator<Res(Args...), kCallingConventionsVariant> {
 
  private:
   // region digitalis - debug: check first arg if it's a pointer
-#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64) && defined(BERBERIS_PROXY_ARG_DIAGNOSTICS)
   static void CheckFirstArgImpl(ThreadState*, void*) {}  // 0-arg overload
   template <typename First, typename... Rest>
   static void CheckFirstArgImpl(ThreadState* state, void* host_func, First first, Rest...) {
@@ -133,7 +139,7 @@ class TrampolineFuncGenerator<Res(Args...), kCallingConventionsVariant> {
   template <typename Func, typename std::size_t... I>
   static void FuncImpl(Func func, ThreadState* state, std::index_sequence<I...>) {
     // region digitalis - pre-extraction raw register check
-#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64) && defined(BERBERIS_PROXY_ARG_DIAGNOSTICS)
     if constexpr (sizeof...(Args) > 0) {
       if constexpr (std::is_pointer_v<std::tuple_element_t<0, std::tuple<Args...>>>) {
         auto raw_x0 = state->cpu.x[0];
@@ -152,7 +158,7 @@ class TrampolineFuncGenerator<Res(Args...), kCallingConventionsVariant> {
     // endregion
     GuestParamsValues<Func, kCallingConventionsVariant> params(state);
     // region digitalis - extraction mismatch check
-#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64) && defined(BERBERIS_PROXY_ARG_DIAGNOSTICS)
     if constexpr (sizeof...(Args) > 0) {
       if constexpr (std::is_pointer_v<std::tuple_element_t<0, std::tuple<Args...>>>) {
         auto* params_ptr = params.template debug_params_addr<0>();

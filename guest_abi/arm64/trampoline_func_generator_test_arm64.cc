@@ -17,6 +17,7 @@
 #include "gtest/gtest.h"
 
 #include "cstddef"
+#include <string>
 
 #include "berberis/base/bit_util.h"
 #include "berberis/guest_abi/function_wrappers.h"
@@ -81,6 +82,34 @@ TEST(TrampolineFuncGenerator64, NarrowResultClearsIncomingArgument) {
   state.cpu.x[0] = 0x0000'7755'228a'd050;
   func(bit_cast<void*>(&Callee::Exception), &state);
   EXPECT_EQ(1u, state.cpu.x[0]);
+}
+
+void* g_forwarded_pointer = nullptr;
+
+// A guest may pass a small non-null value, such as a handle or a sentinel, in a
+// pointer argument. The trampoline forwards it unchanged, and a default build logs
+// nothing for it: the proxy-argument checks are a BERBERIS_PROXY_ARG_DIAGNOSTICS
+// build's only (#956).
+TEST(TrampolineFuncGenerator64, SmallPointerArgumentIsForwardedWithoutLogging) {
+  struct Callee {
+    static void Take(void* pointer) { g_forwarded_pointer = pointer; }
+  };
+
+  TrampolineFunc func = GetTrampolineFunc<void(void*)>();
+
+  ProcessState state{};
+  state.cpu.x[0] = 0x1;
+
+  testing::internal::CaptureStderr();
+  func(bit_cast<void*>(&Callee::Take), &state);
+  std::string logged = testing::internal::GetCapturedStderr();
+
+  EXPECT_EQ(reinterpret_cast<void*>(0x1), g_forwarded_pointer);
+#if defined(BERBERIS_PROXY_ARG_DIAGNOSTICS)
+  EXPECT_NE(std::string::npos, logged.find("BAD proxy PRE-EXTRACT"));
+#else
+  EXPECT_EQ("", logged);
+#endif
 }
 // endregion
 
