@@ -159,6 +159,7 @@ cc_library_static {
         "sys_ptrace_emulation.cc",
         "unistd_emulation.cc",
         "arm64/epoll_emulation.cc",
+        "arm64/proc_self_syscall_emulation.cc",
         "arm64/syscall_emulation_arch.cc",
         "arm64/syscall_emulation.cc",
     ],
@@ -183,6 +184,7 @@ cc_test_library {
         "arm64/munmap_protected_mapping_test.cc",
         "arm64/open_proc_self_relative_test.cc",
         "arm64/proc_self_maps_host_image_test.cc",
+        "arm64/proc_self_syscall_emulation_test.cc",
         "arm64/seccomp_neuter_test.cc",
     ],
     header_libs: [

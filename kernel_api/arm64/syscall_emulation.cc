@@ -44,6 +44,9 @@
 
 #include "epoll_emulation.h"
 #include "guest_types.h"
+// region digitalis
+#include "proc_self_syscall_emulation.h"
+// endregion
 
 namespace berberis {
 
@@ -321,6 +324,68 @@ void RunGuestSyscall(ThreadState* state) {
     }
   }
 
+  // region digitalis
+  // The guest view of the thread's own /proc/.../syscall file (#1030); see
+  // proc_self_syscall_emulation.h. Every branch is a no-op until such a file
+  // is open.
+  if (HasEmulatedProcSelfSyscallFds()) {
+    switch (guest_nr) {
+      case kGuestNrProcSyscallRead:
+      case kGuestNrProcSyscallReadv:
+      case kGuestNrProcSyscallPread64:
+      case kGuestNrProcSyscallPreadv: {
+        const uint64_t args[6] = {state->cpu.x[0],
+                                  state->cpu.x[1],
+                                  state->cpu.x[2],
+                                  state->cpu.x[3],
+                                  state->cpu.x[4],
+                                  state->cpu.x[5]};
+        bool positional =
+            guest_nr == kGuestNrProcSyscallPread64 || guest_nr == kGuestNrProcSyscallPreadv;
+        // The kernel reports the PC after the svc, and insn_addr is the svc's own.
+        RefreshEmulatedProcSelfSyscall(static_cast<long>(state->cpu.x[0]),
+                                       positional ? static_cast<long>(state->cpu.x[3]) : -1,
+                                       guest_nr,
+                                       args,
+                                       state->cpu.sp,
+                                       state->cpu.insn_addr + 4);
+        break;
+      }
+      case kGuestNrProcSyscallFstat: {
+        struct stat real_stat;
+        if (state->cpu.x[1] != 0 &&
+            GetEmulatedProcSelfSyscallStat(static_cast<long>(state->cpu.x[0]), &real_stat)) {
+          ConvertHostStatToGuestArch(real_stat, state->cpu.x[1]);
+          state->cpu.x[0] = 0;
+          if (kInstrumentSyscalls) {
+            OnSyscallReturn(state, guest_nr);
+          }
+          return;
+        }
+        break;
+      }
+      case kGuestNrProcSyscallFstatfs: {
+        struct stat real_stat;
+        if (GetEmulatedProcSelfSyscallStat(static_cast<long>(state->cpu.x[0]), &real_stat)) {
+          // statfs, not fstatfs: the memfd's own filesystem is not procfs.
+          long r = syscall(__NR_statfs, "/proc", state->cpu.x[1]);
+          state->cpu.x[0] = (r == -1) ? -errno : r;
+          if (kInstrumentSyscalls) {
+            OnSyscallReturn(state, guest_nr);
+          }
+          return;
+        }
+        break;
+      }
+      case kGuestNrProcSyscallClose:
+        ForgetEmulatedProcSelfSyscall(static_cast<long>(state->cpu.x[0]));
+        break;
+      default:
+        break;
+    }
+  }
+  // endregion
+
   long result = RunGuestSyscallImpl(guest_nr,
                                     state->cpu.x[0],
                                     state->cpu.x[1],
@@ -328,6 +393,12 @@ void RunGuestSyscall(ThreadState* state) {
                                     state->cpu.x[3],
                                     state->cpu.x[4],
                                     state->cpu.x[5]);
+  // region digitalis
+  if ((guest_nr == kGuestNrProcSyscallOpenat || guest_nr == kGuestNrProcSyscallOpenat2) &&
+      result >= 0) {
+    result = MaybeEmulateProcSelfSyscallOpen(ToHostAddr<const char>(state->cpu.x[1]), result);
+  }
+  // endregion
   if (result == -1) {
     state->cpu.x[0] = -errno;
   } else {
