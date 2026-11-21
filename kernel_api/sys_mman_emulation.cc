@@ -70,8 +70,13 @@ void UpdateGuestProt(int guest_prot, void* addr, size_t length) {
 // it might pick up an already obsolete code.
 
 void* MmapForGuest(void* addr, size_t length, int prot, int flags, int fd, off64_t offset) {
-  // region digitalis - keep kernel-placed guest mappings below 2^39
+  // region digitalis
 #if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  if ((flags & (MAP_FIXED | kMmapFixedNoReplace)) && IntersectsCodeWindow(addr, length)) {
+    errno = (flags & kMmapFixedNoReplace) ? EEXIST : EACCES;
+    return MAP_FAILED;
+  }
+  // Keep kernel-placed guest mappings below 2^39.
   void* result = MAP_FAILED;
   if (ShouldPlaceInGuestMmapWindow(addr, flags)) {
     result = MmapInGuestMmapWindow(length, ToHostProt(prot), flags, fd, offset);
@@ -200,6 +205,12 @@ void* MmapForGuest(void* addr, size_t length, int prot, int flags, int fd, off64
 
 int MunmapForGuest(void* addr, size_t length) {
   // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  if (IntersectsCodeWindow(addr, length)) {
+    errno = EACCES;
+    return -1;
+  }
+#endif
   // Guests that scan "/proc/self/maps" also munmap mappings protected from
   // them (see MprotectForGuest). Keep those mappings and their executable bits
   // intact: clearing the bits even briefly lets another thread cache a NoExec
@@ -216,6 +227,14 @@ int MunmapForGuest(void* addr, size_t length) {
 }
 
 int MprotectForGuest(void* addr, size_t length, int prot) {
+  // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  if (IntersectsCodeWindow(addr, length)) {
+    errno = EACCES;
+    return -1;
+  }
+#endif
+  // endregion
   // In b/218772975 the app is scanning "/proc/self/maps" and tries to mprotect
   // mappings for some libraries found there (for unknown reason) effectively removing
   // execution permission. GuestMapShadow is pre-populated with such mappings, so we
@@ -232,6 +251,21 @@ int MprotectForGuest(void* addr, size_t length, int prot) {
 }
 
 void* MremapForGuest(void* old_addr, size_t old_size, size_t new_size, int flags, void* new_addr) {
+  // region digitalis
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  // old_size == 0 can clone a shareable mapping, so still check its source page.
+  if (IntersectsCodeWindow(old_addr, old_size == 0 ? kPageSize : old_size) ||
+      ((flags & MREMAP_FIXED) && IntersectsCodeWindow(new_addr, new_size))) {
+    errno = EACCES;
+    return MAP_FAILED;
+  }
+  if (!(flags & MREMAP_MAYMOVE) && IntersectsCodeWindow(old_addr, new_size)) {
+    // Preserve the retry signal for growth blocked by an existing mapping.
+    errno = ENOMEM;
+    return MAP_FAILED;
+  }
+#endif
+  // endregion
   // As we drop xbit for host mmap calls, host mappings might differ from guest
   // mappings, and host mremap might work when guest mremap should not. Check in
   // advance to avoid that. Rules for checks:
