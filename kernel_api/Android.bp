@@ -139,6 +139,7 @@ cc_library_static {
     arch: {
         x86_64: {
             srcs: [
+                "arm64/guest_mmap_window.cc",
                 "arm64/open_emulation.cc",
                 "open_emulation.cc",
                 "runtime_bridge.cc",
@@ -179,6 +180,7 @@ cc_test_library {
     defaults: ["berberis_test_library_defaults_64"],
     srcs: [
         "arm64/futex_eintr_test.cc",
+        "arm64/guest_mmap_window_test.cc",
         "arm64/guest_system_library_path_test.cc",
         "arm64/mmap_bss_zero_test.cc",
         "arm64/munmap_protected_mapping_test.cc",

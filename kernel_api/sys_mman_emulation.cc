@@ -26,6 +26,8 @@
 #include <cstring>
 #include <elf.h>
 #include <unistd.h>
+
+#include "arm64/guest_mmap_window.h"
 #endif
 // endregion
 
@@ -68,7 +70,21 @@ void UpdateGuestProt(int guest_prot, void* addr, size_t length) {
 // it might pick up an already obsolete code.
 
 void* MmapForGuest(void* addr, size_t length, int prot, int flags, int fd, off64_t offset) {
+  // region digitalis - keep kernel-placed guest mappings below 2^39
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  void* result = MAP_FAILED;
+  if (ShouldPlaceInGuestMmapWindow(addr, flags)) {
+    result = MmapInGuestMmapWindow(length, ToHostProt(prot), flags, fd, offset);
+  }
+  if (result == MAP_FAILED) {
+    result = mmap64(addr, length, ToHostProt(prot), flags, fd, offset);
+  }
+#else
+  // endregion
   void* result = mmap64(addr, length, ToHostProt(prot), flags, fd, offset);
+  // region digitalis
+#endif
+  // endregion
   if (result != MAP_FAILED) {
     UpdateGuestProt(prot, result, length);
   }
@@ -236,7 +252,22 @@ void* MremapForGuest(void* old_addr, size_t old_size, size_t new_size, int flags
     }
   }
 
+  // region digitalis - a growing mapping the kernel may move stays below 2^39
+#if defined(NATIVE_BRIDGE_GUEST_ARCH_ARM64)
+  void* result = MAP_FAILED;
+  if ((flags & MREMAP_MAYMOVE) && !(flags & (MREMAP_FIXED | MREMAP_DONTUNMAP)) && old_size != 0 &&
+      new_size > old_size && reinterpret_cast<uintptr_t>(old_addr) < kGuestMmapWindowEnd) {
+    result = MremapIntoGuestMmapWindow(old_addr, old_size, new_size);
+  }
+  if (result == MAP_FAILED) {
+    result = mremap(old_addr, old_size, new_size, flags, new_addr);
+  }
+#else
+  // endregion
   void* result = mremap(old_addr, old_size, new_size, flags, new_addr);
+  // region digitalis
+#endif
+  // endregion
 
   if (result != MAP_FAILED) {
     shadow->RemapExecutable(ToGuestAddr(old_addr), old_size, ToGuestAddr(result), new_size);
