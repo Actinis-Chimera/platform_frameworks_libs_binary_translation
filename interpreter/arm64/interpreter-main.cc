@@ -16,8 +16,11 @@
 
 #include "berberis/interpreter/arm64/interpreter.h"
 
+#include "berberis/base/bit_util.h"
+#include "berberis/base/config.h"
 #include "berberis/decoder/arm64/decoder.h"
 #include "berberis/decoder/arm64/semantics_player.h"
+#include "berberis/guest_os_primitives/guest_map_shadow.h"
 #include "berberis/guest_state/guest_addr.h"
 #include "berberis/guest_state/guest_state.h"
 #include "berberis/guest_state/guest_state_opaque.h"
@@ -50,9 +53,36 @@ void InterpretBatch(ThreadState* state, int max_insns, TranslationCache* cache) 
   SemanticsPlayer sem_player(&interpreter);
   Decoder decoder(&sem_player);
 
+  // region digitalis
+  // A fetch from a page without PROT_EXEC must fault before the instruction
+  // runs, as it does on hardware, so that a guest SIGSEGV handler can make
+  // the page executable and resume. Only the
+  // dispatcher raises that fault (TranslateRegion installs kEntryNoExec), so
+  // hand a PC on a non-executable page back to it instead of decoding the
+  // page's bytes. Check once per page: the shadow lookup is a bitmap read.
+  // The page tracking assumes the 4-byte A64 instruction never straddles a
+  // page, which alignment guarantees.
+  const GuestMapShadow* shadow = GuestMapShadow::GetInstance();
+  GuestAddr checked_page = 0;
+  // endregion
   for (int i = 0; i < max_insns; i++) {
     GuestAddr pc = state->cpu.insn_addr;
     if (pc == 0 || ArePendingSignalsPresent(*state)) break;
+
+    // region digitalis
+    GuestAddr page = AlignDown(pc, config::kGuestPageSize);
+    if (page != checked_page) {
+      if (!shadow->IsExecutable(pc, 4)) {
+        // At the batch's first PC the dispatcher got here through an
+        // interpret entry cached while the page was executable. Drop it, so
+        // the next dispatch reaches TranslateRegion and its NoExec fault
+        // instead of returning here without progress.
+        if (i == 0) cache->InvalidateGuestRange(pc, pc + 4);
+        break;
+      }
+      checked_page = page;
+    }
+    // endregion
 
     interpreter.Reset();
     uint8_t insn_len = decoder.Decode(ToHostAddr<const uint16_t>(pc));
