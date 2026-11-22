@@ -70,6 +70,7 @@ cc_library_static {
         "digitalis_extra_libnativehelper_trampolines.cc",
         "digitalis_extra_libbinder_ndk_trampolines.cc",
         "digitalis_extra_libcamera2ndk_trampolines.cc",
+        "digitalis_extra_libegl_angle_procs.cc",
         "digitalis_extra_libegl_trampolines.cc",
         "digitalis_extra_libglesv2_trampolines.cc",
         "digitalis_extra_libnativewindow_trampolines.cc",
@@ -105,6 +106,8 @@ cc_test_library {
     ],
     srcs: [
         "camera2ndk_shared_capture_callbacks_test.cc",
+        "digitalis_extra_libegl_angle_procs.cc",
+        "digitalis_extra_libegl_angle_procs_test.cc",
         "digitalis_extra_proxy_no_crash_test.cc",
         "named_trampoline_override.cc",
         "named_trampoline_override_test.cc",
