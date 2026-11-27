@@ -4,7 +4,8 @@
 # Most are ISA extensions outside the implemented baseline (A64 base plus
 # AdvSIMD/NEON and crypto) -- SVE/SVE2, SME/SME2, FP8, FEAT_FHM,
 # FEAT_FAMINMAX, FEAT_THE, FEAT_LSFE (the LDFADD/LDBFMAX/... floating-point
-# atomics) -- where Undefined is the correct decode. They reach
+# atomics), FEAT_CMPBR (the CB<cc>/CBB<cc>/CBH<cc> compare-and-branch forms),
+# FEAT_PAuth_LR (RETAASPPC) -- where Undefined is the correct decode. They reach
 # the corpus because it is harvested from current libraries, which contain
 # runtime-dispatched code paths for CPUs that have those features.
 #
@@ -34,6 +35,26 @@ bfmops
 bftmopa
 bmopa
 bmops
+cbbeq
+cbbge
+cbbgt
+cbbhi
+cbbhs
+cbbne
+cbeq
+cbge
+cbgt
+cbheq
+cbhge
+cbhgt
+cbhhi
+cbhhs
+cbhi
+cbhne
+cbhs
+cblo
+cblt
+cbne
 dcps1
 dcps2
 dcps3
@@ -102,6 +123,7 @@ rcwsclra
 rcwsclrl
 rcwsswp
 rcwswpl
+retaasppc
 sclamp
 sdot
 sel

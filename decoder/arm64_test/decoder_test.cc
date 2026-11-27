@@ -819,6 +819,53 @@ TEST(Arm64DecoderTest, ReservedUndefined) {
   }
 }
 
+// ============================================================================
+// Branches, Exception Generating, and System (top op0=101x, bits[31:29]=op0):
+//   - CBZ/CBNZ (bit25=0) and TBZ/TBNZ (bit25=1) occupy ONLY op0=001 and 101.
+//   - op0=011 (0x74..0x77) and op0=111 (0xf4..0xf7) are unallocated in base
+//     ARMv8-A (bit25=0 later holds unimplemented FEAT_CMPBR; bit25=1 is
+//     unallocated) and MUST decode to Undefined so trap words such as
+//     0xf4ccffcc deliver SIGILL instead of silently executing as CBZ/TBZ.
+//   - Conditional branches (op0=010) require bit25=0 and bit24=0; bit24=1
+//     (FEAT_PAuth_LR RETAASPPC/RETABSPPC) and bit25=1 (unallocated) must
+//     decode to Undefined rather than B.cond.
+// ============================================================================
+TEST(Arm64DecoderTest, BranchExceptionSystemUnallocated) {
+  struct Row {
+    uint32_t enc;
+    const char* name;
+    const char* note;
+  };
+  const Row rows[] = {
+      // Valid encodings in op0=001 / 101 / 010.
+      {0x34000000, "CompareAndBranch", "cbz w0, #0"},
+      {0xb5000041, "CompareAndBranch", "cbnz x1, #8"},
+      {0x36180082, "TestAndBranch", "tbz w2, #3, #16"},
+      {0xb7180084, "TestAndBranch", "tbnz x4, #35, #16"},
+      {0x54000040, "BranchCond", "b.eq #8"},
+      {0x54000051, "BranchCond", "bc.ne #8 (FEAT_HBC hinted b.cond)"},
+      // Unallocated op0=011 / 111 (must never alias CBZ/CBNZ/TBZ/TBNZ).
+      {0xf4ccffcc, "Undefined", "unallocated trap word (op0=111, bit25=0)"},
+      {0x74000000, "Undefined", "unallocated/FEAT_CMPBR (op0=011, bit25=0, bit24=0)"},
+      {0x75000000, "Undefined", "unallocated/FEAT_CMPBR (op0=011, bit25=0, bit24=1)"},
+      {0x76000000, "Undefined", "unallocated (op0=011, bit25=1, bit24=0)"},
+      {0x77000000, "Undefined", "unallocated (op0=011, bit25=1, bit24=1)"},
+      {0xf402169a, "Undefined", "FEAT_CMPBR cbgt (op0=111, bit25=0)"},
+      {0xf6000000, "Undefined", "unallocated (op0=111, bit25=1, bit24=0)"},
+      {0xf7ffffff, "Undefined", "unallocated (op0=111, bit25=1, bit24=1)"},
+      // Unallocated op0=010 with bit25=1 or bit24=1 (must never alias B.cond).
+      {0x55000000, "Undefined", "unallocated (op0=010, bit25=0, bit24=1)"},
+      {0x5500001f, "Undefined", "FEAT_PAuth_LR retaasppc (op0=010, bit25=0, bit24=1)"},
+      {0x56000000, "Undefined", "unallocated (op0=010, bit25=1, bit24=0)"},
+      {0x57000000, "Undefined", "unallocated (op0=010, bit25=1, bit24=1)"},
+  };
+  for (const auto& r : rows) {
+    Recorder rec = Decode(r.enc);
+    SCOPED_TRACE(r.note);
+    EXPECT_STREQ(rec.name, r.name);
+  }
+}
+
 }  // namespace
 
 }  // namespace berberis

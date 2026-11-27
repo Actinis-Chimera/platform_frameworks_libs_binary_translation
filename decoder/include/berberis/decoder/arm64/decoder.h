@@ -2207,15 +2207,21 @@ class Decoder {
         DecodeBranchImm();
         break;
       case 0b010:
-        // Conditional branch: B.cond.
-        DecodeBranchCond();
+        // Conditional branch: B.cond (010_1010_0_imm19_0_cond) and FEAT_HBC
+        // BC.cond (010_1010_0_imm19_1_cond).
+        // bit25==1 (0x56.. / 0x57..) is unallocated; bit24==1 (0x55..) is
+        // unallocated in base A64 (FEAT_PAuth_LR RETAASPPC/RETABSPPC live
+        // there and must not decode as B.cond).
+        if (GetBits<25, 1>() || GetBits<24, 1>()) {
+          Undefined();
+        } else {
+          DecodeBranchCond();
+        }
         break;
       case 0b001:
       case 0b101:
-        // Both CBZ/CBNZ and TBZ/TBNZ have op0=x01.
+        // Both CBZ/CBNZ and TBZ/TBNZ live exclusively at op0=0b001 and 0b101.
         // Distinguish by bit25: 0=CBZ/CBNZ, 1=TBZ/TBNZ.
-        // // Compare and branch: CBZ/CBNZ.
-        // DecodeCompareAndBranch();
         if (GetBits<25, 1>()) {
           DecodeTestAndBranch();
         } else {
@@ -2224,14 +2230,11 @@ class Decoder {
         break;
       case 0b011:
       case 0b111:
-        // // Test and branch: TBZ/TBNZ.
-        // DecodeTestAndBranch();
-        // Same dispatch as above — both x01 and x11 can reach here.
-        if (GetBits<25, 1>()) {
-          DecodeTestAndBranch();
-        } else {
-          DecodeCompareAndBranch();
-        }
+        // Unallocated in base ARMv8-A (bit25=0 later holds Armv9.4 FEAT_CMPBR
+        // compare-and-branch, which is neither implemented nor advertised;
+        // bit25=1 is unallocated). Must decode to Undefined so trap words such
+        // as 0xf4ccffcc deliver SIGILL instead of silently executing as CBZ/TBZ.
+        Undefined();
         break;
       case 0b110: {
         // This group contains: Unconditional branch (register), Exception generation, System.
